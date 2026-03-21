@@ -2,6 +2,10 @@
  * SDXF JavaScript Translation - Complete & Array Optimized
  * Translated from the Python library sdxf.py
  * Uses String.fromCharCode(10) and Array.join() for maximum performance and inline worker safety.
+ * 
+ * Updated: Added bulge support to PolyLine and LwPolyLine classes.
+ *          Pass { bulge: -1 } to apply arc bulge to all vertices (e.g. for donut/filled circles).
+ *          Pass an array of bulge values to apply per-vertex bulge.
  */
 
 const NL = String.fromCharCode(10);
@@ -220,14 +224,37 @@ class Line extends Entity {
     }
 }
 
+/**
+ * PolyLine entity with optional per-vertex bulge.
+ * 
+ * @param {Array} points - Array of [x, y, z] coordinate arrays.
+ * @param {Object} options
+ * @param {number|null} options.bulge - Bulge value applied to ALL vertices (e.g. -1 for donut arcs).
+ *                                       Use 1 for CCW semicircle, -1 for CW semicircle.
+ *                                       A two-point closed polyline with bulge=-1 on each vertex
+ *                                       produces a filled circle (donut) when combined with width.
+ * @param {Array|null}  options.bulges - Array of per-vertex bulge values (overrides bulge if set).
+ *                                       Length must match points array.
+ * @param {number|null} options.width  - Constant width for all segments.
+ * @param {number}      options.closed - 1 to close the polyline, 0 for open.
+ * 
+ * @example
+ * // Solid filled circle (donut) at (100, 200) with diameter 20:
+ * new PolyLine(
+ *     [[95, 200, 0], [105, 200, 0]],
+ *     { closed: 1, width: 10, bulge: -1, layer: 'REO', color: 1 }
+ * )
+ */
 class PolyLine extends Entity {
-    constructor(points, { flag = 0, width = null, elevation = null, closed = 0, ...commonOptions } = {}) {
+    constructor(points, { flag = 0, width = null, elevation = null, closed = 0, bulge = null, bulges = null, ...commonOptions } = {}) {
         super(commonOptions);
         this.points = points;
         this.flag = flag;
         this.width = width;
         this.elevation = elevation;
         this.closed = closed;
+        this.bulge = bulge;
+        this.bulges = bulges;
     }
 
     toString() {
@@ -239,8 +266,16 @@ class PolyLine extends Entity {
         if (this.closed) lines.push('70', '1');
         if (this.width !== null) lines.push('40', this.width, '41', this.width);
         
-        for (let point of this.points) {
+        for (let idx = 0; idx < this.points.length; idx++) {
+            const point = this.points[idx];
             lines.push('0', 'VERTEX', '5', '2', _point(point), '8', '0');
+            
+            // Per-vertex bulge: bulges array takes priority, then uniform bulge
+            if (this.bulges !== null && idx < this.bulges.length) {
+                lines.push('42', this.bulges[idx]);
+            } else if (this.bulge !== null) {
+                lines.push('42', this.bulge);
+            }
         }
         lines.push('0', 'SEQEND');
         
@@ -248,21 +283,38 @@ class PolyLine extends Entity {
     }
 }
 
+/**
+ * LwPolyLine entity with optional per-vertex bulge.
+ * 
+ * @param {Array} points - Array of [x, y] coordinate arrays.
+ * @param {Object} options
+ * @param {number|null} options.bulge  - Bulge value applied to ALL vertices.
+ * @param {Array|null}  options.bulges - Array of per-vertex bulge values (overrides bulge if set).
+ */
 class LwPolyLine extends Entity {
-    constructor(points, { flag = 0, width = null, elevation = null, ...commonOptions } = {}) {
+    constructor(points, { flag = 0, width = null, elevation = null, bulge = null, bulges = null, ...commonOptions } = {}) {
         super(commonOptions);
         this.points = points;
         this.flag = flag;
         this.width = width;
         this.elevation = elevation;
+        this.bulge = bulge;
+        this.bulges = bulges;
     }
 
     toString() {
         const lines = ['0', 'LWPOLYLINE', this._common()];
         if (this.width !== null) lines.push('43', this.width);
         if (this.elevation !== null) lines.push('38', this.elevation);
-        for (let point of this.points) {
+        for (let idx = 0; idx < this.points.length; idx++) {
+            const point = this.points[idx];
             lines.push(_point(point));
+            
+            if (this.bulges !== null && idx < this.bulges.length) {
+                lines.push('42', this.bulges[idx]);
+            } else if (this.bulge !== null) {
+                lines.push('42', this.bulge);
+            }
         }
         lines.push('0');
         return lines.join(NL);
@@ -566,4 +618,4 @@ class Drawing extends Collection {
 
         return [header, tables, blocks, entities, '0', 'EOF', ''].join(NL);
     }
-                }
+}
