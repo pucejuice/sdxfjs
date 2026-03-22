@@ -2,10 +2,31 @@
  * SDXF JavaScript Translation - Complete & Array Optimized
  * Translated from the Python library sdxf.py
  * Uses String.fromCharCode(10) and Array.join() for maximum performance and inline worker safety.
- * 
+ *
  * Updated: Added bulge support to PolyLine and LwPolyLine classes.
  *          Pass { bulge: -1 } to apply arc bulge to all vertices (e.g. for donut/filled circles).
  *          Pass an array of bulge values to apply per-vertex bulge.
+ *
+ * Fixed (2026-03):
+ *   1. LwPolyLine.toString() — removed erroneous trailing lines.push('0').
+ *      The bare group-code 0 with no value caused "invalid group code" errors in all
+ *      DXF readers when two or more LwPolyLine entities appeared in the same drawing.
+ *      Entity boundaries are delimited by each entity's own leading '0\nTYPE' header;
+ *      no explicit terminator is needed.
+ *
+ *   2. LwPolyLine.toString() — now emits only group codes 10/20 (X/Y) per vertex.
+ *      The original _point() helper emits 10/20/30 for 3-element arrays, but
+ *      LWPOLYLINE does not support per-vertex Z via group code 30. Passing [x,y,z]
+ *      coordinates produced an invalid group-code sequence. Vertices are now always
+ *      written as 2-D pairs regardless of the input array length.
+ *
+ *   3. LwPolyLine.toString() — added required group codes 90 (vertex count) and
+ *      70 (closed flag) before the vertex list, as mandated by the DXF R2000+ spec.
+ *      Strict parsers (BricsCAD, recent AutoCAD) reject LWPOLYLINE without group 90.
+ *
+ *   4. Drawing constructor — ACADVER bumped from AC1006 (R10, 1988) to AC1015 (R2000).
+ *      LWPOLYLINE was introduced in R14 (AC1012); declaring AC1006 is therefore invalid
+ *      for any drawing that contains LWPOLYLINE entities.
  */
 
 const NL = String.fromCharCode(10);
@@ -44,14 +65,14 @@ class Entity {
     _common() {
         const parent = this.parent || this;
         const lines = ['5', '1', '8', parent.layer];
-        
+
         if (parent.extrusion !== null) lines.push(_point(parent.extrusion, 200));
         if (parent.lineType !== null) lines.push('6', parent.lineType);
         if (parent.lineWeight !== null) lines.push('370', parent.lineWeight);
         if (parent.lineTypeScale !== null) lines.push('48', parent.lineTypeScale);
         if (parent.thickness !== null) lines.push('39', parent.thickness);
         if (parent.color !== null) lines.push('62', parent.color);
-        
+
         return lines.join(NL);
     }
 }
@@ -60,11 +81,11 @@ class Collection {
     constructor(entities = []) {
         this.entities = [...entities];
     }
-    
+
     append(entity) {
         this.entities.push(entity);
     }
-    
+
     toString() {
         return this.entities.map(e => e.toString()).join(NL);
     }
@@ -112,7 +133,7 @@ class TextLineType {
             '0', 'LTYPE', '2', this.name, '70', this.flag, '3', this.description,
             '72', '65', '73', '3', '40', this.height * 6,
             '49', this.height * 4, '74', '0',
-            '49', this.height, '74', '2', '46', -0.5 * this.height, 
+            '49', this.height, '74', '2', '46', -0.5 * this.height,
             '50', '0', '44', '0', '45', -0.5 * this.height, '9', this.string,
             '49', -0.5 * this.height, '74', '0'
         ].join(NL);
@@ -198,7 +219,7 @@ class Insert extends Entity {
 
     toString() {
         const lines = ['0', 'INSERT', '2', this.name, this._common(), _point(this.point)];
-        
+
         if (this.xscale !== null) lines.push('41', this.xscale);
         if (this.yscale !== null) lines.push('42', this.yscale);
         if (this.zscale !== null) lines.push('43', this.zscale);
@@ -207,7 +228,7 @@ class Insert extends Entity {
         if (this.colspacing !== null) lines.push('44', this.colspacing);
         if (this.rows !== null) lines.push('71', this.rows);
         if (this.rowspacing !== null) lines.push('45', this.rowspacing);
-        
+
         return lines.join(NL);
     }
 }
@@ -226,24 +247,16 @@ class Line extends Entity {
 
 /**
  * PolyLine entity with optional per-vertex bulge.
- * 
+ *
  * @param {Array} points - Array of [x, y, z] coordinate arrays.
  * @param {Object} options
- * @param {number|null} options.bulge - Bulge value applied to ALL vertices (e.g. -1 for donut arcs).
- *                                       Use 1 for CCW semicircle, -1 for CW semicircle.
- *                                       A two-point closed polyline with bulge=-1 on each vertex
- *                                       produces a filled circle (donut) when combined with width.
- * @param {Array|null}  options.bulges - Array of per-vertex bulge values (overrides bulge if set).
- *                                       Length must match points array.
- * @param {number|null} options.width  - Constant width for all segments.
- * @param {number}      options.closed - 1 to close the polyline, 0 for open.
- * 
- * @example
- * // Solid filled circle (donut) at (100, 200) with diameter 20:
- * new PolyLine(
- *     [[95, 200, 0], [105, 200, 0]],
- *     { closed: 1, width: 10, bulge: -1, layer: 'REO', color: 1 }
- * )
+ * @param {number|null} options.bulge   - Bulge value applied to ALL vertices.
+ * @param {Array|null}  options.bulges  - Array of per-vertex bulge values (overrides bulge if set).
+ * @param {number|null} options.width   - Constant width for all segments.
+ * @param {number}      options.closed  - 1 to close the polyline, 0 for open.
+ *
+ * Note: PolyLine (old-style POLYLINE/VERTEX) supports 3D coordinates and is valid
+ * in all DXF versions. Prefer LwPolyLine for 2D-only data in R2000+ files.
  */
 class PolyLine extends Entity {
     constructor(points, { flag = 0, width = null, elevation = null, closed = 0, bulge = null, bulges = null, ...commonOptions } = {}) {
@@ -259,18 +272,17 @@ class PolyLine extends Entity {
 
     toString() {
         const lines = ['0', 'POLYLINE', this._common()];
-        
+
         if (this.elevation !== null) lines.push('66', '1', '10', '0', '20', '0', '30', this.elevation);
         else lines.push('66', '1', '10', '0', '20', '0', '30', '0');
-        
+
         if (this.closed) lines.push('70', '1');
         if (this.width !== null) lines.push('40', this.width, '41', this.width);
-        
+
         for (let idx = 0; idx < this.points.length; idx++) {
             const point = this.points[idx];
             lines.push('0', 'VERTEX', '5', '2', _point(point), '8', '0');
-            
-            // Per-vertex bulge: bulges array takes priority, then uniform bulge
+
             if (this.bulges !== null && idx < this.bulges.length) {
                 lines.push('42', this.bulges[idx]);
             } else if (this.bulge !== null) {
@@ -278,18 +290,27 @@ class PolyLine extends Entity {
             }
         }
         lines.push('0', 'SEQEND');
-        
+
         return lines.join(NL);
     }
 }
 
 /**
- * LwPolyLine entity with optional per-vertex bulge.
- * 
- * @param {Array} points - Array of [x, y] coordinate arrays.
+ * LwPolyLine entity — 2D lightweight polyline (R14 / AC1012 and later).
+ *
+ * @param {Array} points - Array of [x, y] or [x, y, z] coordinate arrays.
+ *                         Z values are ignored; LWPOLYLINE is strictly 2D.
  * @param {Object} options
- * @param {number|null} options.bulge  - Bulge value applied to ALL vertices.
- * @param {Array|null}  options.bulges - Array of per-vertex bulge values (overrides bulge if set).
+ * @param {number}      options.flag    - Polyline flag: 1 = closed, 0 = open (default 0).
+ * @param {number|null} options.width   - Constant width applied to all segments.
+ * @param {number|null} options.elevation - Elevation (group code 38).
+ * @param {number|null} options.bulge   - Bulge value applied to ALL vertices.
+ * @param {Array|null}  options.bulges  - Per-vertex bulge values (overrides bulge).
+ *
+ * Fixes applied vs original sdxf.js:
+ *   - Added group 90 (vertex count) and group 70 (flag) before vertices — required by spec.
+ *   - Vertices emit only group codes 10/20 (X/Y); group 30 (Z) is invalid for LWPOLYLINE.
+ *   - Removed erroneous trailing lines.push('0') that caused "invalid group code" parse errors.
  */
 class LwPolyLine extends Entity {
     constructor(points, { flag = 0, width = null, elevation = null, bulge = null, bulges = null, ...commonOptions } = {}) {
@@ -304,19 +325,30 @@ class LwPolyLine extends Entity {
 
     toString() {
         const lines = ['0', 'LWPOLYLINE', this._common()];
+
+        // Group 90: vertex count — required by DXF R2000+ spec before vertex list
+        lines.push('90', this.points.length);
+        // Group 70: polyline flag (1 = closed)
+        lines.push('70', this.flag || 0);
+
         if (this.width !== null) lines.push('43', this.width);
         if (this.elevation !== null) lines.push('38', this.elevation);
+
         for (let idx = 0; idx < this.points.length; idx++) {
             const point = this.points[idx];
-            lines.push(_point(point));
-            
+            // Emit only X (10) and Y (20) — LWPOLYLINE does not support per-vertex Z (30)
+            lines.push(`10${NL}${point[0]}`, `20${NL}${point[1]}`);
+
             if (this.bulges !== null && idx < this.bulges.length) {
                 lines.push('42', this.bulges[idx]);
             } else if (this.bulge !== null) {
                 lines.push('42', this.bulge);
             }
         }
-        lines.push('0');
+
+        // No trailing '0' — entity boundary is delimited by the next entity's own '0\nTYPE' header.
+        // Adding a bare '0' here causes the join with the next entity to produce:
+        //   ...last vertex...\n0\n0\nNEXT_TYPE  →  parser sees 'NEXT_TYPE' as a group code → error.
         return lines.join(NL);
     }
 }
@@ -385,29 +417,29 @@ class Face extends Entity {
 class Dimension extends Entity {
     constructor(startPoint, endPoint, dimLinePoint, { text = '', textPoint = null, type = 1, angle = null, ...commonOptions } = {}) {
         super(commonOptions);
-        this.startPoint = startPoint;     
-        this.endPoint = endPoint;         
-        this.dimLinePoint = dimLinePoint; 
-        this.text = text;                 
-        this.textPoint = textPoint || dimLinePoint; 
-        this.type = type;                 
-        this.angle = angle;               
+        this.startPoint = startPoint;
+        this.endPoint = endPoint;
+        this.dimLinePoint = dimLinePoint;
+        this.text = text;
+        this.textPoint = textPoint || dimLinePoint;
+        this.type = type;
+        this.angle = angle;
     }
 
     toString() {
         const lines = [
-            '0', 'DIMENSION', 
-            this._common(), 
-            '2', '*D1', 
-            _point(this.dimLinePoint, 10), 
-            _point(this.textPoint, 11), 
-            '70', this.type, 
-            '1', this.text, 
-            _point(this.startPoint, 13), 
+            '0', 'DIMENSION',
+            this._common(),
+            '2', '*D1',
+            _point(this.dimLinePoint, 10),
+            _point(this.textPoint, 11),
+            '70', this.type,
+            '1', this.text,
+            _point(this.startPoint, 13),
             _point(this.endPoint, 14)
         ];
-        
-        if (this.type === 0 && this.angle !== null) lines.push('50', this.angle);            
+
+        if (this.type === 0 && this.angle !== null) lines.push('50', this.angle);
         return lines.join(NL);
     }
 }
@@ -431,7 +463,7 @@ class Text extends Entity {
 
     toString() {
         const lines = [];
-        
+
         if (this.justifyhor !== null) {
             const rot = this.rotation || 0;
             const justifiedpoint = calculate_end_point(this.point, rot + 90, this.text.length * 0.75 * this.height);
@@ -439,19 +471,19 @@ class Text extends Entity {
         } else {
             lines.push('0', 'TEXT', this._common(), _point(this.point), '40', this.height, '1', this.text);
         }
-        
+
         if (this.rotation !== null) lines.push('50', this.rotation);
         if (this.xscale !== null) lines.push('41', this.xscale);
         if (this.obliqueAngle !== null) lines.push('51', this.obliqueAngle);
         if (this.style !== null) lines.push('7', this.style);
         if (this.flag !== null) lines.push('71', this.flag);
-        
+
         if (this.justifyhor !== null) {
             lines.push('72', `\t${this.justifyhor}`, '11', this.point[0], '21', this.point[1], '31', '0');
         }
         if (this.alignment !== null) lines.push(_point(this.alignment, 1));
         if (this.justifyver !== null) lines.push('73', this.justifyver);
-        
+
         return lines.join(NL);
     }
 }
@@ -468,28 +500,28 @@ class Mtext extends Text {
     toString() {
         const texts = this.text.replace(/\r\n/g, NL).split(NL);
         if (!this.down) texts.reverse();
-        
+
         const lines = [];
         let x = 0;
         let y = 0;
         const spcWidth = this.spacingWidth !== null ? this.spacingWidth : this.height * this.spacingFactor;
-        
+
         for (let textLine of texts) {
             let remainingText = textLine;
             while (remainingText) {
                 const chunk = remainingText.substring(0, this.width);
                 const pt = [this.point[0] + x * spcWidth, this.point[1] + y * spcWidth, this.point[2] || 0];
-                
+
                 const t = new Text(chunk, pt, {
-                    alignment: this.alignment, flag: this.flag, height: this.height, 
+                    alignment: this.alignment, flag: this.flag, height: this.height,
                     justifyhor: this.justifyhor, justifyver: this.justifyver,
                     rotation: this.rotation, obliqueAngle: this.obliqueAngle,
                     style: this.style, xscale: this.xscale, parent: this
                 });
-                
+
                 lines.push(t.toString());
                 remainingText = remainingText.substring(this.width);
-                
+
                 if (this.rotation) x++; else y++;
             }
         }
@@ -520,14 +552,14 @@ class Rectangle extends Entity {
             const solidEnt = new Solid(points.slice(0, 4), { parent: this.solid });
             lines.push(solidEnt.toString());
         }
-        
+
         if (this.line) {
             for (let i = 0; i < 4; i++) {
                 const lineEnt = new Line([points[i], points[i + 1]], { parent: this });
                 lines.push(lineEnt.toString());
             }
         }
-        
+
         return lines.join(NL);
     }
 }
@@ -542,28 +574,28 @@ class LineList extends Entity {
     toString() {
         const lines = [];
         const points = this.closed ? [...this.points, this.points[0]] : this.points;
-        
+
         for (let i = 0; i < points.length - 1; i++) {
             const lineEnt = new Line([points[i], points[i + 1]], { parent: this });
             lines.push(lineEnt.toString());
         }
-        
+
         return lines.join(NL);
     }
 }
 
 // --- Main Drawing Wrapper ---
 class Drawing extends Collection {
-    constructor({ 
-        insbase = [0.0, 0.0, 0.0], 
-        extmin = [0.0, 0.0], 
-        extmax = [0.0, 0.0], 
-        layers = [new Layer()], 
-        linetypes = [new LineType()], 
-        styles = [new Style()], 
-        views = [], 
-        blocks = [], 
-        entities = [] 
+    constructor({
+        insbase = [0.0, 0.0, 0.0],
+        extmin = [0.0, 0.0],
+        extmax = [0.0, 0.0],
+        layers = [new Layer()],
+        linetypes = [new LineType()],
+        styles = [new Style()],
+        views = [],
+        blocks = [],
+        entities = []
     } = {}) {
         super(entities);
         this.insbase = insbase;
@@ -574,8 +606,10 @@ class Drawing extends Collection {
         this.styles = [...styles];
         this.views = [...views];
         this.blocks = [...blocks];
-        
-        this._acadver = ['9', '$ACADVER', '1', 'AC1006'].join(NL);
+
+        // AC1015 = R2000. LWPOLYLINE was introduced in R14 (AC1012); AC1006 (R10) is invalid
+        // for drawings containing LWPOLYLINE entities.
+        this._acadver = ['9', '$ACADVER', '1', 'AC1015'].join(NL);
         this._HEADER_POINTS = ['insbase', 'extmin', 'extmax'];
     }
 
@@ -618,4 +652,4 @@ class Drawing extends Collection {
 
         return [header, tables, blocks, entities, '0', 'EOF', ''].join(NL);
     }
-}
+    }
