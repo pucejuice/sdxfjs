@@ -10,6 +10,7 @@ const {
   Drawing, Layer, LineType, DimStyle, Block, DynamicBlock, Insert, AttDef,
   Line, LwPolyLine, Circle, Arc, Ellipse, Spline, Point, Text, MText, Solid, Hatch, Leader,
   LinearDimension, AlignedDimension, RadiusDimension, DiameterDimension, AngularDimension,
+  OrdinateDimension, XLine, Ray, Wipeout, MLeader, Table,
   arrayRect, arrayPolar,
 } = X;
 
@@ -232,6 +233,71 @@ test('dimensions_and_leaders', () => {
   close(m[3], 400, 'radius'); close(m[4], 800, 'diameter'); close(m[5], Math.atan2(800, 500), 'angle');
   const texts = dims.map(x => x._block.entities.find(e => e instanceof Text).text);
   assert.deepStrictEqual(texts, ['2350', '200', 'L = 1118', 'R400', '%%c800', '58%%d']);
+  return d;
+});
+
+test('groups_xlines_wipeout_ordinate', () => {
+  const d = new Drawing({ units: 'mm' });
+  const a = new Line([[0, 0, 0], [100, 0, 0]]), b = new Circle([50, 50, 0], 20);
+  const tb = new Table([200, 100], [['A', 'B'], [1, 2]]);
+  [a, b, tb].forEach(e => d.append(e));
+  d.addGroup('FRAME', [a, b], { description: 'frame members' });
+  d.addGroup('SCHEDULE', [tb]);
+  throws(() => d.addGroup('frame'), /already exists/);
+  d.append(new XLine([0, 0], [1, 1]));
+  d.append(new Ray([0, 0], [1, 0]).rotate(30));
+  d.append(new Wipeout([[20, 20], [80, 20], [80, 60], [20, 60]]));
+  d.append(new Text('MASKED', [50, 40, 0], { height: 8, align: 'MIDDLE_CENTER' }));
+  const od = [new OrdinateDimension([30, 0], [30, -60]), new OrdinateDimension([100, 50], [160, 50]),
+              new OrdinateDimension([100, 0], [100, -60], { origin: [50, 0], axis: 'x' })];
+  od.forEach(x => d.append(x));
+  const s = d.toString();
+  assert.deepStrictEqual(od.map(x => x._r.measurement), [30, 50, 50]);
+  assert.deepStrictEqual(od.map(x => x._r.type & 64), [64, 0, 64], 'x / y ordinate flags');
+  assert.ok(s.includes('ACAD_WIPEOUT_VARS') && s.includes('\nCLASSES\n'), 'wipeout class + vars');
+  assert.ok(s.endsWith('EOF\n'), 'trailing newline');
+  const r = new Ray([0, 0], [1, 0]).rotate(90);
+  closePt(r.direction, [0, 1], 'rotated ray direction');
+  const d2 = new Drawing(); d2.addGroup('X', [new Line([[0, 0], [1, 1]])]);
+  throws(() => d2.toString(), /not in the drawing/);
+  return d;
+});
+
+test('multileaders', () => {
+  const d = new Drawing({ units: 'mm', dimstyles: [new DimStyle({ name: 'S20', scale: 20 })] });
+  d.append(new Circle([0, 0, 0], 100));
+  d.append(new MLeader([[70, 70], [400, 400]], 'T16 @ 200 B1', { dimstyle: 'S20' }));
+  d.append(new MLeader([[-70, 70], [-300, 300], [-400, 300]], 'LINE ONE\nLINE TWO', { dimstyle: 'S20' }));
+  d.append(new MLeader([[0, -100], [200, -400]], 'SCALED', { height: 80 }).mirror([0, 0], [0, 1]));
+  throws(() => new MLeader([[0, 0]], 'x'), /2 points/);
+  const s = d.toString();
+  assert.ok(s.includes('ACAD_MLEADERSTYLE') && s.includes('MULTILEADER'), 'mleader style + class');
+  assert.ok(s.includes('LINE ONE\\PLINE TWO'), 'newline → \\P');
+  return d;
+});
+
+test('tables', () => {
+  const d = new Drawing({ units: 'mm' });
+  const t = new Table([0, 0], [
+    ['Mark', 'Type', 'Dia', 'No.', 'Length', 'Shape'],
+    ['01', 'B', 16, 8, 2350, { text: 'Straight', rowspan: 2 }],
+    ['02', 'B', 12, 24, 1200],
+    [{ text: 'Total mass (kg)', colspan: 4, align: 'RIGHT' }, 66.7, ''],
+  ], { title: 'BAR SCHEDULE', textHeight: 25, headerFill: 8, align: ['CENTER', 'CENTER', 'RIGHT', 'RIGHT', 'RIGHT', 'LEFT'],
+       format: (v, r, c) => (typeof v === 'number' && c === 4 && r > 0) ? v.toFixed(1) : v });
+  d.append(t);
+  const g = t._grid();
+  assert.strictEqual(g.widths.length, 6); assert.strictEqual(g.heights.length, 5);
+  assert.strictEqual(g.cells.find(c => c.text === 'Straight').rs, 2);
+  assert.strictEqual(g.cells.find(c => c.text === '66.7').c, 4, 'value after colspan 4 lands in column 4');
+  const lines = t._entities().filter(e => e instanceof Line);
+  const n = t._entities().filter(e => e instanceof MText).length;
+  assert.strictEqual(n, 1 + 6 + 6 + 5 + 2, 'title + header + rows (merged and empty cells skipped)');
+  d.append(new Table([0, -500], [['A', 'B'], ['1', '2']], { colWidths: [100, 60], rowHeights: 40, textHeight: 20, rotation: 90 }));
+  throws(() => new Table([0, 0], [[{ text: 'x', colspan: 2 }, 'y'], ['a', { text: 'b', rowspan: 0 }]], { colWidths: [1] })._entities(), /colWidths/);
+  throws(() => new Table([0, 0], [['a', { text: 'b', rowspan: 2 }], [{ text: 'c', colspan: 2 }]]), /covered/);
+  const ragged = new Table([0, 0], [['a', 'b', 'c'], ['d']])._grid();
+  assert.strictEqual(ragged.cells.length, 6, 'short row padded with empty cells');
   return d;
 });
 

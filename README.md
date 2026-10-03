@@ -67,7 +67,11 @@ Every entity accepts these options:
 | `Text(text, point, { height, rotation, align })` | `align`: `LEFT`, `CENTER`, `MIDDLE_CENTER`, `TOP_RIGHT`, and so on. |
 | `MText(text, point, { height, width, attach, lineSpacing })` | `\n` starts a new line. |
 | `Hatch(boundary \| [outer, ...holes], { pattern, scale, angle })` | Patterns: `SOLID`, `ANSI31`, `ANSI32`, `ANSI37`, `NET`, `DOTS`, `EARTH`, or `{ name, lines }`. A boundary can be an `LwPolyLine`; its arcs are kept. |
-| `Leader(points, text, { dimstyle, height })` | Arrow at the first point, MText at the last. |
+| `Leader(points, text, { dimstyle, height })` | Classic LEADER: arrow at the first point, MText at the last. |
+| `MLeader(points, text, { dimstyle, height, arrowSize, dogleg, gap })` | MULTILEADER: arrow tip … connection point, then a landing and the text on the side the leader points to. Sizes come from the dimstyle; a given `height` scales the rest with it. |
+| `Table(topLeft, rows, { title, colWidths, rowHeights, textHeight, align, header, headerFill, format, rotation })` | Drawn with lines, MText and solid fills. Cells can be values or `{ text, align, colspan, rowspan, fill }`. Sizes left as `null` fit the text. |
+| `XLine(point, direction)`, `Ray(point, direction)` | Construction lines. |
+| `Wipeout(points)` | Masks what was drawn before it, so append it before the text on top. Drawing option `wipeoutFrame`. |
 | `Insert(block, point, { rotation, xscale, yscale, attributes, params, rows, cols, rowSpacing, colSpacing })` | `rows`/`cols` make a grid of block references (MINSERT). |
 
 ### Dimensions
@@ -80,6 +84,7 @@ These match ezdxf's argument order where possible:
 | `RadiusDimension(center, r, { angle })` | Text: `R400`. |
 | `DiameterDimension(center, r, { angle })` | Text: `Ø800`. |
 | `AngularDimension(vertex, p1, p2, { radius })` | Measured anticlockwise from p1 to p2. |
+| `OrdinateDimension(feature, leaderEnd, { origin, axis })` | X or Y distance from `origin`. `axis` defaults to `'x'` when the leader is mostly vertical. |
 
 - `text: 'd = <>'` overrides the text; `<>` is replaced by the measured value.
 - The script draws each dimension's lines and text itself, so it renders the same everywhere.
@@ -87,6 +92,13 @@ These match ezdxf's argument order where possible:
 `DimStyle({ name, scale, textHeight, arrowSize, tickSize, gap, decimals, angleDecimals, measureScale, suffix })`:
 - `scale` is DIMSCALE. Use 50 for a 1:50 drawing in mm.
 - `tickSize > 0` draws oblique ticks instead of arrows.
+
+### Groups
+```js
+const g = d.addGroup('GRID A', [line1, line2], { description: 'grid line A', selectable: true });
+g.add(line3);
+```
+Group members must be in the drawing's model space. A `Table` or `Leader` joins as all of its pieces.
 
 ### Transforms and arrays
 Every entity has these methods, which change it in place and can be chained:
@@ -152,13 +164,15 @@ ezdxf is a ~140k-line Python library that **reads, edits and writes** every DXF 
 sdxf.js only **writes** R2000 drawings, and is aimed at 2D drafting automation.
 
 **Similar to ezdxf**
-- Lines, polylines, arcs, circles, ellipses and splines.
+- Lines, polylines, arcs, circles, ellipses, splines, XLINE/RAY and wipeouts.
 - TEXT and MTEXT.
 - Hatches: solid, standard patterns, holes and arcs.
 - Blocks, block references with attributes, and grids of block references (MINSERT).
-- XDATA.
+- Groups and XDATA.
 - Layers, linetypes, lineweights and true colour.
-- Linear, aligned, radius, diameter and angular dimensions, and leaders.
+- Linear, aligned, radius, diameter, angular and ordinate dimensions.
+- LEADER and MULTILEADER (MText content).
+- Tables, drawn from lines and text like ezdxf's table add-on.
 - Transforms and arrays.
 
 **Beyond ezdxf:** parametric blocks with stretch, move, array, flip, visibility states and lookup tables.
@@ -167,9 +181,9 @@ sdxf.js only **writes** R2000 drawings, and is aimed at 2D drafting automation.
 
 | Feature | Effort |
 |---|---|
-| Groups, XLINE/RAY, WIPEOUT, ordinate dimensions | S |
 | Paper-space layouts with viewports (drawing sheets), IMAGE references | M |
-| MLEADER, TABLE, R12 output | M–L |
+| MULTILEADER with block content, R12 output | M |
+| AutoCAD's own TABLE entity (needs DXF 2004+; ezdxf can't create it either) | L |
 | 3D entities (3DFACE, MESH, polyface), ACIS solids | L |
 | Reading and editing existing DXF files, other DXF versions, binary DXF | Very large (essentially ezdxf's core) |
 | Rendering to SVG/PDF/PNG, font-based text measurement, geometry kernel | Very large |

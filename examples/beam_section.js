@@ -1,7 +1,7 @@
 // node examples/beam_section.js  →  writes beam_section.dxf
 // RC beam section drawn from design inputs: hatch, bar layout, dimensions, notes.
 const fs = require('fs');
-const { Drawing, Layer, DimStyle, LwPolyLine, Line, Hatch, MText, LinearDimension } = require('../sdxf.js');
+const { Drawing, Layer, DimStyle, LwPolyLine, Line, Hatch, MText, LinearDimension, MLeader, Table } = require('../sdxf.js');
 
 // ── Design inputs (mm) ─────────────────────────────────────────────────────────
 const b = 300, h = 600, cover = 40, link = 10;
@@ -51,6 +51,29 @@ dwg.append(new Line([[b / 2, -50, 0], [b / 2, h + 50, 0]], { layer: 'CENTRE' }))
 dwg.append(new LinearDimension([0, 0], [b, 0], [0, -120], { dimstyle: '1to10', layer: 'DIMS' }));
 dwg.append(new LinearDimension([b, 0], [b, h], [b + 120, 0], { angle: 90, dimstyle: '1to10', layer: 'DIMS' }));
 dwg.append(new LinearDimension([0, yBot], [0, h], [-120, 0], { angle: 90, dimstyle: '1to10', layer: 'DIMS', text: 'd = <>' }));
+
+// Bar callouts
+const [b1] = barCentres(bottom.n, bottom.dia, yBot), [t1] = barCentres(top.n, top.dia, yTop);
+dwg.append(new MLeader([[b1[0] - 5, b1[1] - 5], [-150, -60]], `01 ${bottom.n}B${bottom.dia}`, { dimstyle: '1to10', layer: 'TEXT' }));
+dwg.append(new MLeader([[t1[0] - 5, t1[1] + 5], [-150, h + 60]], `02 ${top.n}B${top.dia}`, { dimstyle: '1to10', layer: 'TEXT' }));
+
+// Bar schedule — lengths and masses from the section for a 6 m beam
+const L = 6000;
+const mass = (dia, n, len) => n * Math.PI * dia ** 2 / 4 * len * 7.85e-6;   // kg (mm, steel 7850 kg/m³)
+const linkLen = 2 * (b + h - 4 * cover) + 24 * link;                         // shape code 51 approx.
+const schedule = [
+  ['01', bottom.dia, bottom.n, L - 2 * cover, '00'],
+  ['02', top.dia, top.n, L - 2 * cover, '00'],
+  ['03', link, Math.floor((L - 2 * cover) / 200) + 1, linkLen, '51'],
+].map(([mark, dia, n, len, shape]) => [mark, `B${dia}`, n, len, shape, mass(dia, n, len)]);
+const total = schedule.reduce((s, r) => s + r[5], 0);
+dwg.append(new Table([600, h + 100], [
+  ['Mark', 'Size', 'No.', 'Length (mm)', 'Shape', 'Mass (kg)'],
+  ...schedule,
+  [{ text: 'Total', colspan: 5, align: 'RIGHT' }, total],
+], { title: 'BAR SCHEDULE', textHeight: 25, headerFill: 9, layer: 'TEXT',
+     align: ['CENTER', 'CENTER', 'RIGHT', 'RIGHT', 'CENTER', 'RIGHT'],
+     format: (v, r, c) => c === 5 && typeof v === 'number' ? v.toFixed(1) : v }));
 
 dwg.append(new MText(
   `SECTION A-A  (1:10)\n` +

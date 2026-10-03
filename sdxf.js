@@ -30,6 +30,7 @@
  * Ellipse, Spline (control or fit points), Leader, Radius/Diameter/AngularDimension.
  * Transforms on every entity: copy, translate, rotate, scale, mirror; arrayRect,
  * arrayPolar; MINSERT grids. Dynamic blocks: flip, visibility, array, lookups.
+ * Groups, XLine/Ray, Wipeout, OrdinateDimension, MLeader (MULTILEADER), Table.
  * Full API: README.md. Tests: npm test.
  *
  * Blocks & attributes:
@@ -76,6 +77,11 @@ function _preAllocHandles() {
 
 // Handle of the BLOCK_RECORD that owns the entities currently being written.
 let _owner = null;
+// Groups of the top-level entity being written: its model-space pieces get
+// ACAD_REACTORS to these groups and are recorded as members.
+let _groupCtx = null;
+// Handles that MULTILEADER needs (set by Drawing.toString before the entities).
+let _H_MLSTYLE = null, _H_TEXTSTYLE = null, _H_LT_BYBLOCK = null;
 const DYN_APPID = 'SDXF_DYNBLOCK';
 
 function _point(x, index = 0) { return x.map((val, i) => `${(i + 1) * 10 + index}${NL}${val}`).join(NL); }
@@ -119,7 +125,12 @@ class Entity {
     const parent = this.parent || this;
     // Group 5: unique handle. Group 330: owner = block table record of the
     // block being written (*Model_Space for the ENTITIES section).
-    const lines = ['5', handle, '330', owner, '100', 'AcDbEntity', '8', parent.layer];
+    const lines = ['5', handle];
+    if (_groupCtx && owner === _H_MODEL_BTR) {
+      lines.push('102', '{ACAD_REACTORS', ..._groupCtx.flatMap(g => ['330', g._handle]), '102', '}');
+      _groupCtx.forEach(g => g._members.push(handle));
+    }
+    lines.push('330', owner, '100', 'AcDbEntity', '8', parent.layer);
     if (parent.lineType !== null) lines.push('6', parent.lineType);
     if (parent.color !== null && parent.color !== 256) lines.push('62', parent.color);
     if (parent.trueColor !== null && parent.trueColor !== undefined) lines.push('420', _rgb(parent.trueColor));
@@ -283,7 +294,7 @@ class LineType {
   }
   toString() {
     const total = this.elements.reduce((a, e) => a + Math.abs(e), 0);
-    const lines = ['0','LTYPE','5',_nextHandle(),'330',_H_LTYPE_TBL,
+    const lines = ['0','LTYPE','5',this._handle = _nextHandle(),'330',_H_LTYPE_TBL,
             '100','AcDbSymbolTableRecord','100','AcDbLinetypeTableRecord',
             '2',this.name,'70',this.flag,'3',this.description,'72','65','73',this.elements.length,'40',total];
     for (const e of this.elements) lines.push('49', e, '74', '0');
@@ -297,7 +308,7 @@ class Style {
     this.font = font.toUpperCase(); this.bigFont = bigFont.toUpperCase();
   }
   toString() {
-    return ['0','STYLE','5',_nextHandle(),'330',_H_STYLE_TBL,
+    return ['0','STYLE','5',this._handle = _nextHandle(),'330',_H_STYLE_TBL,
             '100','AcDbSymbolTableRecord','100','AcDbTextStyleTableRecord',
             '2',this.name,'70',this.flag,'40',this.height,'41',this.widthFactor,
             '50',this.obliqueAngle,'71',this.mirror,'42',this.lastHeight,'3',this.font,'4',this.bigFont].join(NL);
@@ -1274,6 +1285,258 @@ class AngularDimension extends Dimension {
   }
 }
 
+/**
+ * Ordinate dimension: the X or Y distance of `feature` from `origin`, with a
+ * leader to `leaderEnd`. axis: 'x' | 'y' (default: 'x' when the leader is
+ * mostly vertical, as in AutoCAD).
+ */
+class OrdinateDimension extends Dimension {
+  constructor(feature, leaderEnd, { origin = [0, 0], axis = null, ...options } = {}) {
+    super(options); this.feature = feature; this.leaderEnd = leaderEnd; this.origin = origin; this.axis = axis;
+    if (axis !== null && axis !== 'x' && axis !== 'y') throw new Error(`OrdinateDimension axis must be 'x' or 'y'`);
+  }
+  _pts() { return [this.feature, this.leaderEnd]; }
+  _transformExtra(info) { this.origin = [...this.origin]; _apply(info.m, this.origin); }
+  _render(style) {
+    const f = this.feature, e = this.leaderEnd, s = style.scale;
+    const axis = this.axis || (Math.abs(e[1] - f[1]) >= Math.abs(e[0] - f[0]) ? 'x' : 'y');
+    const value = axis === 'x' ? f[0] - this.origin[0] : f[1] - this.origin[1];
+    const u = _unit(_sub(e, f)), ang = Math.atan2(u[1], u[0]) * 180 / Math.PI;
+    const ents = [new Line([_xyz(_add(f, _mul(u, style.extOffset * s))), _xyz(e)], _BYBLOCK)];
+    const flip = _normAngle(ang) > 90 && _normAngle(ang) <= 270;   // keep the text readable
+    const pos = _add(e, _mul(u, style.gap * s));
+    ents.push(new Text(this._label(style.format(value)), _xyz(pos), { height: style.textHeight * s,
+      rotation: _normAngle(flip ? ang - 180 : ang), align: flip ? 'MIDDLE_RIGHT' : 'MIDDLE_LEFT', ..._BYBLOCK }));
+    return { ents, defpoint: this.origin, textPt: pos, measurement: value, type: 6 | (axis === 'x' ? 64 : 0),
+             sub: ['100', 'AcDbOrdinateDimension', _point(_xyz(f), 3), _point(_xyz(e), 4)] };
+  }
+}
+
+// ── Construction lines, wipeout ───────────────────────────────────────────────
+/** Infinite construction line through `point` along `direction`. */
+class XLine extends Entity {
+  constructor(point, direction, common = {}) {
+    super(common); this.point = point; this.direction = _unit(direction);
+  }
+  get _type() { return ['XLINE', 'AcDbXline']; }
+  _pts() { return [this.point]; }
+  _transformExtra(info) {
+    const [a, b, c, d] = info.m, [x, y] = this.direction;
+    this.direction = _unit([a * x + c * y, b * x + d * y]).map(_num);
+  }
+  toString() {
+    const [type, sub] = this._type;
+    return ['0', type, this._common(), '100', sub, _point(_xyz(this.point)), _point([...this.direction, 0], 1), ...this._xdata()].join(NL);
+  }
+}
+/** Construction line starting at `point`, infinite along `direction`. */
+class Ray extends XLine {
+  get _type() { return ['RAY', 'AcDbRay']; }
+}
+/**
+ * Wipeout: a polygon that masks whatever was drawn before it (draw order is file
+ * order, so append the wipeout before the text that sits on top of it).
+ */
+class Wipeout extends Entity {
+  constructor(points, common = {}) {
+    super(common);
+    if (!points || points.length < 3) throw new Error('Wipeout needs at least 3 points');
+    this.points = points.map(p => [p[0], p[1]]);
+  }
+  _pts() { return this.points; }
+  toString() {
+    const [[x0, y0], [x1, y1]] = _bboxOf(this.points), w = x1 - x0, h = y1 - y0;
+    if (!(w > 0 && h > 0)) throw new Error('Wipeout boundary has no area');
+    // boundary in image pixel coordinates of a 1×1 image: x right, y down, centred on 0
+    const px = [...this.points, this.points[0]].map(([x, y]) => [_num((x - x0) / w - 0.5), _num(0.5 - (y - y0) / h)]);
+    const lines = ['0','WIPEOUT',this._common(),'100','AcDbWipeout','90','0',_point([x0, y0, 0]),
+                   _point([w, 0, 0], 1),_point([0, h, 0], 2),_point([1, 1], 3),'340','0','70','7',
+                   '280','1','281','50','282','50','283','0','360','0','71','2','91',px.length];
+    px.forEach(([x, y]) => lines.push('14', x, '24', y));
+    return [...lines, ...this._xdata()].join(NL);
+  }
+}
+
+// ── Multileader ───────────────────────────────────────────────────────────────
+/**
+ * MULTILEADER with MText content. `points` run from the arrow tip to the
+ * connection point; a horizontal landing (dogleg) and the text follow, on the
+ * side the last segment points to.
+ *   new MLeader([[0,0],[300,400]], 'T16 @ 200 B1', { dimstyle: 'S50' })
+ * Sizes default from the dimstyle (× its scale): text height, arrow size, gap;
+ * dogleg = 2 × arrow size. Giving `height` scales arrow, gap and dogleg with it.
+ */
+class MLeader extends Entity {
+  constructor(points, text, { dimstyle = 'Standard', height = null, arrowSize = null, dogleg = null, gap = null, ...common } = {}) {
+    super(common);
+    if (!points || points.length < 2) throw new Error('MLeader needs at least 2 points (arrow tip … connection point)');
+    if (text === null || text === undefined || String(text) === '') throw new Error('MLeader needs text');
+    this.points = points; this.text = String(text); this.dimstyle = dimstyle;
+    this.height = height; this.arrowSize = arrowSize; this.dogleg = dogleg; this.gap = gap; this._style = null;
+  }
+  _pts() { return this.points; }
+  _transformExtra(info) {
+    for (const k of ['height', 'arrowSize', 'dogleg', 'gap']) if (this[k] !== null) this[k] *= info.s;
+  }
+  _layout() {
+    const st = this._style || (this.dimstyle instanceof DimStyle ? this.dimstyle : new DimStyle());
+    // a given text height scales the other sizes with it
+    const k = this.height !== null ? this.height / st.textHeight : st.scale;
+    const h = st.textHeight * k, arrow = this.arrowSize ?? st.arrowSize * k;
+    const dogleg = this.dogleg ?? 2 * st.arrowSize * k, gap = this.gap ?? st.gap * k;
+    const n = this.points.length, conn = this.points[n - 1], prev = this.points[n - 2];
+    const right = conn[0] >= prev[0];
+    const rows = this.text.split('\n');
+    const w = Math.max(...rows.map(r => r.length)) * h * 0.9;   // estimate; AutoCAD re-measures
+    const tx = right ? conn[0] + dogleg + gap : conn[0] - dogleg - gap - w;
+    return { h, arrow, dogleg, gap, conn, right, w, rows, tx, top: conn[1] + h / 2 };
+  }
+  _bbox() {
+    const L = this._layout();
+    return _union([_bboxOf(this.points), [[L.tx, L.top - L.rows.length * L.h * 1.67], [L.tx + L.w, L.top]]]);
+  }
+  toString() {
+    if (!_H_MLSTYLE) throw new Error('MLeader must be written through a Drawing');
+    const L = this._layout(), [cx, cy] = L.conn, BYBLOCK = '-1056964608';
+    const lines = ['0','MULTILEADER',this._common(),'100','AcDbMLeader','270','2',
+      '300','CONTEXT_DATA{','40','1','10',_num(L.tx - L.gap),'20',cy,'30','0','41',L.h,'140',L.arrow,'145',L.gap,
+      '174','1','175','1','176','0','177','0','290','1','304',this.text.replace(/\r?\n/g, '\\P'),
+      '11','0','21','0','31','1','340',_H_TEXTSTYLE,'12',_num(L.tx),'22',_num(L.top),'32','0',
+      '13','1','23','0','33','0','42','0','43','0','44','0','45','1','170','1','90',BYBLOCK,'171','1','172','1',
+      '91','-939524096','141','1.5','92','0','291','0','292','0','173','0','293','0','142','0','143','0',
+      '294','0','295','1','296','0','110','0','120','0','130','0','111','1','121','0','131','0',
+      '112','0','122','1','132','0','297','0',
+      '302','LEADER{','290','1','291','1','10',cx,'20',cy,'30','0','11',L.right ? 1 : -1,'21','0','31','0',
+      '90','0','40',L.dogleg,'304','LEADER_LINE{'];
+    this.points.slice(0, -1).forEach(p => lines.push(_point(_xyz(p))));
+    lines.push('91','0','92',BYBLOCK,'305','}','303','}','301','}',
+      '340',_H_MLSTYLE,'90','2147483647','170','1','91',BYBLOCK,'341',_H_LT_BYBLOCK,'171','-2',
+      '290','1','291','1','41',L.dogleg,'42',L.arrow,'172','2','343',_H_TEXTSTYLE,'173','1','95','1',
+      '174','1','175','0','92',BYBLOCK,'292','0','93',BYBLOCK,'10','1','20','1','30','1','43','0','176','0','293','0');
+    return [...lines, ...this._xdata()].join(NL);
+  }
+}
+
+// ── Table ─────────────────────────────────────────────────────────────────────
+/**
+ * Table drawn with lines, MText and optional solid fills (renders everywhere;
+ * AutoCAD's own TABLE entity needs DXF 2004+).
+ *   new Table([0, 0], [
+ *     ['Mark', 'Type', 'Ø', 'No.', 'Length'],
+ *     ['01', 'T', 16, 8, 2350],
+ *   ], { title: 'BAR SCHEDULE', textHeight: 2.5, align: ['CENTER', 'CENTER', 'RIGHT', 'RIGHT', 'RIGHT'] })
+ * `insert` is the top-left corner; rows run downwards.
+ * A cell is a value or { text, align, colspan, rowspan, fill }.
+ * Options: colWidths / rowHeights (number, array or null = fit text),
+ * margin, header (number of header rows), headerFill (ACI colour),
+ * borderColor, textColor, format(value, row, col), rotation.
+ */
+class Table extends Entity {
+  constructor(insert, rows, { colWidths = null, rowHeights = null, textHeight = 2.5, margin = null, align = 'LEFT',
+                              header = 1, headerFill = null, title = null, borderColor = null, textColor = null,
+                              format = null, rotation = 0, ...common } = {}) {
+    super(common);
+    this.insert = insert; this.rows = rows; this.colWidths = colWidths; this.rowHeights = rowHeights;
+    this.textHeight = textHeight; this.margin = margin ?? textHeight * 0.6; this.align = align;
+    this.header = header; this.headerFill = headerFill; this.title = title;
+    this.borderColor = borderColor; this.textColor = textColor; this.format = format; this.rotation = rotation;
+    this._grid();   // validate early
+  }
+  _pts() { return [this.insert]; }
+  _transformExtra(info) {
+    this.rotation = _textRotation(info, this.rotation);
+    this.textHeight *= info.s; this.margin *= info.s;
+    if (typeof this.colWidths === 'number') this.colWidths *= info.s;
+    else if (this.colWidths) this.colWidths = this.colWidths.map(w => w * info.s);
+    if (typeof this.rowHeights === 'number') this.rowHeights *= info.s;
+    else if (this.rowHeights) this.rowHeights = this.rowHeights.map(h => h * info.s);
+  }
+  // Cells placed on a grid: [{ r, c, rs, cs, text, align, fill }], plus size.
+  _grid() {
+    const ncolsGuess = Math.max(...this.rows.map(r => r.reduce((n, c) => n + ((c && c.colspan) || 1), 0)));
+    const data = this.title !== null ? [[{ text: this.title, colspan: ncolsGuess, align: 'CENTER' }], ...this.rows] : this.rows;
+    const taken = [], cells = [];
+    const isTaken = (r, c) => taken[r] && taken[r][c];
+    data.forEach((row, r) => {
+      let c = 0;
+      row.forEach(cell => {
+        while (isTaken(r, c)) c++;
+        const o = cell !== null && typeof cell === 'object' ? cell : { text: cell };
+        const rs = o.rowspan || 1, cs = o.colspan || 1;
+        for (let i = r; i < r + rs; i++) for (let j = c; j < c + cs; j++) {
+          if (isTaken(i, j)) throw new Error(`Table: cell (${i}, ${j}) is covered by two merged cells`);
+          (taken[i] = taken[i] || [])[j] = true;
+        }
+        const dataRow = this.title !== null ? r - 1 : r;
+        let text = o.text ?? '';
+        if (this.format && dataRow >= 0) text = this.format(text, dataRow, c);
+        const colAlign = Array.isArray(this.align) ? this.align[c] || 'LEFT' : this.align;
+        cells.push({ r, c, rs, cs, text: String(text), align: String(o.align || colAlign).toUpperCase(), fill: o.fill ?? null });
+        c += cs;
+      });
+    });
+    const nrows = taken.length, ncols = Math.max(...taken.map(t => t.length));
+    // short rows: fill the gaps with empty cells so every border is drawn
+    for (let r = 0; r < nrows; r++) for (let c = 0; c < ncols; c++)
+      if (!isTaken(r, c)) cells.push({ r, c, rs: 1, cs: 1, text: '', align: 'LEFT', fill: null });
+    for (const cl of cells) if (!['LEFT', 'CENTER', 'RIGHT'].includes(cl.align)) throw new Error(`Table: align must be LEFT, CENTER or RIGHT, got '${cl.align}'`);
+    const h = this.textHeight, m = this.margin;
+    const lines = t => t.split('\n');
+    const textW = t => Math.max(...lines(t).map(l => l.length)) * h * 0.8;
+    const textH = t => (lines(t).length - 1) * h * 1.67 + h;
+    const size = (spec, n, need, what) => {
+      if (typeof spec === 'number') return Array(n).fill(spec);
+      if (Array.isArray(spec)) { if (spec.length !== n) throw new Error(`Table: ${what} needs ${n} values`); return spec; }
+      return Array.from({ length: n }, (_, i) => need(i));
+    };
+    const widths = size(this.colWidths, ncols, j => Math.max(h + 2 * m,
+      ...cells.filter(x => x.c === j && x.cs === 1).map(x => textW(x.text) + 2 * m)), 'colWidths');
+    const heights = size(this.rowHeights, nrows, i => Math.max(h + 2 * m,
+      ...cells.filter(x => x.r === i && x.rs === 1).map(x => textH(x.text) + 2 * m)), 'rowHeights');
+    return { cells, widths, heights, headerRows: this.header + (this.title !== null ? 1 : 0) };
+  }
+  /** The table as plain entities (lines, MText, solid hatches), already placed. */
+  _entities() {
+    const { cells, widths, heights, headerRows } = this._grid();
+    const xs = [0], ys = [0];
+    widths.forEach(w => xs.push(xs[xs.length - 1] + w));
+    heights.forEach(h => ys.push(ys[ys.length - 1] - h));
+    const base = { layer: this.layer, parent: null, lineType: this.lineType, lineWeight: this.lineWeight };
+    const border = { ...base, color: this.borderColor ?? this.color };
+    const txt = { ...base, color: this.textColor ?? this.color };
+    const fills = [], grid = [], texts = [];
+    const W = xs[xs.length - 1], H = ys[ys.length - 1];
+    grid.push(new Line([[0, 0, 0], [W, 0, 0]], border), new Line([[0, 0, 0], [0, H, 0]], border));
+    for (const cl of cells) {
+      const x0 = xs[cl.c], x1 = xs[cl.c + cl.cs], y0 = ys[cl.r], y1 = ys[cl.r + cl.rs];
+      const fill = cl.fill ?? (cl.r < headerRows ? this.headerFill : null);
+      if (fill !== null) fills.push(new Hatch([[x0, y1], [x1, y1], [x1, y0], [x0, y0]], { ...base, pattern: 'SOLID', color: fill }));
+      grid.push(new Line([[x1, y0, 0], [x1, y1, 0]], border), new Line([[x0, y1, 0], [x1, y1, 0]], border));
+      if (cl.text === '') continue;
+      const ym = (y0 + y1) / 2, m = this.margin;
+      const [x, attach] = cl.align === 'LEFT' ? [x0 + m, 'MIDDLE_LEFT'] : cl.align === 'RIGHT' ? [x1 - m, 'MIDDLE_RIGHT'] : [(x0 + x1) / 2, 'MIDDLE_CENTER'];
+      texts.push(new MText(cl.text, [x, ym, 0], { ...txt, height: this.textHeight, attach }));
+    }
+    const all = [...fills, ...grid, ...texts];
+    for (const e of all) {
+      if (this.rotation) e.rotate(this.rotation, [0, 0]);
+      e.translate(this.insert[0], this.insert[1]);
+    }
+    return all;
+  }
+  _bbox() { return _union(this._entities().map(e => e._bbox())); }
+  toString() { return this._entities().map(e => e.toString()).join(NL); }
+}
+
+// ── Group ─────────────────────────────────────────────────────────────────────
+/** Named selection group of model-space entities (Drawing.addGroup). */
+class Group {
+  constructor(name, entities = [], { description = '', selectable = true } = {}) {
+    this.name = String(name); this.entities = [...entities]; this.description = description; this.selectable = selectable;
+  }
+  add(...entities) { this.entities.push(...entities); return this; }
+}
+
 // ── Leader ────────────────────────────────────────────────────────────────────
 /**
  * Leader line with an arrow at the first point and optional MText at the last.
@@ -1320,13 +1583,20 @@ class Drawing extends Collection {
   constructor({ insbase = [0,0,0], extmin = null, extmax = null,
                 layers = [new Layer()], linetypes = [new LineType()], styles = [new Style()],
                 dimstyles = [new DimStyle()], views = [], blocks = [], entities = [],
-                units = null, ltscale = 1 } = {}) {
+                units = null, ltscale = 1, wipeoutFrame = false } = {}) {
     super(entities);
     this.insbase = insbase; this.extmin = extmin; this.extmax = extmax;
     this.layers = [...layers]; this.linetypes = [...linetypes]; this.styles = [...styles];
     this.dimstyles = [...dimstyles]; this.views = [...views]; this.blocks = [...blocks];
-    this.units = units; this.ltscale = ltscale;
+    this.units = units; this.ltscale = ltscale; this.wipeoutFrame = wipeoutFrame; this.groups = [];
     if (!this.dimstyles.some(s => s.name.toUpperCase() === 'STANDARD')) this.dimstyles.unshift(new DimStyle());
+  }
+  /** Create a named group of entities that are (or will be) in this drawing's model space. */
+  addGroup(name, entities = [], options = {}) {
+    if (this.groups.some(g => g.name.toUpperCase() === String(name).toUpperCase())) throw new Error(`Group '${name}' already exists`);
+    const g = new Group(name, entities, options);
+    this.groups.push(g);
+    return g;
   }
   /** Approximate [[xmin,ymin],[xmax,ymax]] of model space (call after adding entities). */
   extents() {
@@ -1395,7 +1665,7 @@ class Drawing extends Collection {
     };
     const visit = e => {
       if (e instanceof Insert) { add(e.source); add(e.block); }
-      if (e instanceof Leader) e._style = this._dimstyle(e.dimstyle);
+      if (e instanceof Leader || e instanceof MLeader) e._style = this._dimstyle(e.dimstyle);
       if (e instanceof Dimension && !seen.has(e)) {
         seen.add(e);
         out.push(e._buildBlock(`*D${++dimCount}`, this._dimstyle(e.dimstyle)));
@@ -1425,6 +1695,20 @@ class Drawing extends Collection {
     const auto = _union(this.entities.map(e => e._bbox())) || [[0, 0], [0, 0]];
     const extmin = this.extmin || auto[0], extmax = this.extmax || auto[1];
     const H_ROOTDICT = _nextHandle(), H_GROUPDICT = _nextHandle();
+    // Optional objects / classes, only when something uses them
+    const used = cls => [...this.entities, ...userBlocks.flatMap(b => b.entities)].some(e => e instanceof cls);
+    const hasWipeout = used(Wipeout), hasMLeader = used(MLeader);
+    const H_WOVARS = hasWipeout ? _nextHandle() : null;
+    const [H_MLSDICT, H_MLS] = hasMLeader ? [_nextHandle(), _nextHandle()] : [null, null];
+    _H_MLSTYLE = H_MLS;
+    const groupOf = new Map();
+    for (const g of this.groups) {
+      g._handle = _nextHandle(); g._members = [];
+      for (const e of g.entities) {
+        if (!this.entities.includes(e)) throw new Error(`Group '${g.name}': an entity is not in the drawing's model space`);
+        groupOf.set(e, [...(groupOf.get(e) || []), g]);
+      }
+    }
 
     // ── TABLES ──────────────────────────────────────────────────
     const btr = (h, name) => ['0','BLOCK_RECORD','5',h,'330',_H_BLOCKTABLE,
@@ -1466,6 +1750,16 @@ class Drawing extends Collection {
       this._table('DIMSTYLE', _H_DIM_TBL,   '0', this.dimstyles.map(x => x.toString())),
       brTable,
     ]);
+    const std = this.styles.find(s => s.name === 'STANDARD') || this.styles[0];
+    _H_TEXTSTYLE = std._handle;
+    _H_LT_BYBLOCK = this.linetypes.find(l => l.name === 'BYBLOCK')._handle;
+
+    // ── CLASSES — custom objects used by this drawing ────────────
+    const classDefs = [
+      ...(hasWipeout ? [['WIPEOUTVARIABLES', 'AcDbWipeoutVariables', 'WipeOut', 0, 0], ['WIPEOUT', 'AcDbWipeout', 'WipeOut', 127, 1]] : []),
+      ...(hasMLeader ? [['MLEADERSTYLE', 'AcDbMLeaderStyle', 'ACDB_MLEADERSTYLE_CLASS', 4095, 0], ['MULTILEADER', 'AcDbMLeader', 'ACDB_MLEADER_CLASS', 3071, 1]] : []),
+    ].map(([n, cpp, app, flags, isEnt]) => ['0','CLASS','1',n,'2',cpp,'3',app,'90',flags,'280','0','281',isEnt].join(NL));
+    const classes = classDefs.length ? this._section('classes', classDefs) : null;
 
     // ── BLOCKS — mandatory *Model_Space and *Paper_Space ─────────
     const modelBlock = [
@@ -1482,15 +1776,36 @@ class Drawing extends Collection {
 
     // ── ENTITIES ─────────────────────────────────────────────────
     _owner = _H_MODEL_BTR;
-    const entities = this._section('entities', this.entities.map(x => x.toString()));
+    const entities = this._section('entities', this.entities.map(e => {
+      _groupCtx = groupOf.get(e) || null;
+      try { return e.toString(); } finally { _groupCtx = null; }
+    }));
     _owner = null;
 
     // ── OBJECTS — root dictionary required for AC1015 ────────────
-    const objects = this._section('objects', [
+    const owned = (h, owner) => ['5', h, '102', '{ACAD_REACTORS', '330', owner, '102', '}', '330', owner];
+    const rootEntries = [['ACAD_GROUP', H_GROUPDICT]];
+    if (hasMLeader) rootEntries.push(['ACAD_MLEADERSTYLE', H_MLSDICT]);
+    if (hasWipeout) rootEntries.push(['ACAD_WIPEOUT_VARS', H_WOVARS]);
+    const objectDefs = [
       ['0','DICTIONARY','5',H_ROOTDICT,'330','0','100','AcDbDictionary','281','1',
-       '3','ACAD_GROUP','350',H_GROUPDICT].join(NL),
-      ['0','DICTIONARY','5',H_GROUPDICT,'330',H_ROOTDICT,'100','AcDbDictionary','281','1'].join(NL),
-    ]);
+       ...rootEntries.flatMap(([k, h]) => ['3', k, '350', h])].join(NL),
+      ['0','DICTIONARY','5',H_GROUPDICT,'330',H_ROOTDICT,'100','AcDbDictionary','281','1',
+       ...this.groups.flatMap(g => ['3', g.name, '350', g._handle])].join(NL),
+      ...this.groups.map(g => ['0','GROUP',...owned(g._handle, H_GROUPDICT),'100','AcDbGroup','300',g.description,
+        '70','0','71',g.selectable ? 1 : 0,...g._members.flatMap(h => ['340', h])].join(NL)),
+    ];
+    if (hasMLeader) objectDefs.push(
+      ['0','DICTIONARY',...owned(H_MLSDICT, H_ROOTDICT),'100','AcDbDictionary','281','1','3','Standard','350',H_MLS].join(NL),
+      ['0','MLEADERSTYLE',...owned(H_MLS, H_MLSDICT),'100','AcDbMLeaderStyle','179','2','170','2','171','1','172','0',
+       '90','2','40','0','41','0','173','1','91','-1056964608','92','-2','290','1','42','2','291','1','43','8',
+       '3','Standard','44','4','300','','342',_H_TEXTSTYLE,'174','1','175','1','176','0','178','1',
+       '93','-1056964608','45','4','292','0','297','0','46','4','94','-1056964608','47','1','49','1','140','1',
+       '294','1','141','0','177','0','142','1','295','0','296','0','143','3.75','271','0','272','9','273','9'].join(NL));
+    if (hasWipeout) objectDefs.push(
+      ['0','WIPEOUTVARIABLES',...owned(H_WOVARS, H_ROOTDICT),'100','AcDbWipeoutVariables','70',this.wipeoutFrame ? 1 : 0].join(NL));
+    const objects = this._section('objects', objectDefs);
+    _H_MLSTYLE = null;
 
     // ── HEADER — written last so $HANDSEED is above every handle used ──
     const header = this._section('header', [
@@ -1505,7 +1820,7 @@ class Drawing extends Collection {
     ]);
 
     // R2000 DXF is not UTF-8: write non-ASCII characters (², °, Ø, …) as \U+XXXX escapes.
-    return [header, tables, blocks, entities, objects, '0', 'EOF', ''].join(NL)
+    return [header, classes, tables, blocks, entities, objects, '0', 'EOF', ''].filter(s => s !== null).join(NL)
       .replace(/[^\x00-\x7F]/gu, ch => {
         const cp = ch.codePointAt(0);
         return cp > 0xFFFF ? '?' : '\\U+' + cp.toString(16).toUpperCase().padStart(4, '0');
@@ -1519,6 +1834,7 @@ if (typeof module !== 'undefined' && module.exports) {
     LinearParameter, FlipParameter, VisibilityParameter,
     Line, LwPolyLine, Circle, Arc, Ellipse, Spline, Point, Text, MText, Solid, Hatch, Leader,
     Dimension, LinearDimension, AlignedDimension, RadiusDimension, DiameterDimension, AngularDimension,
+    OrdinateDimension, XLine, Ray, Wipeout, MLeader, Table, Group,
     Collection, Entity, arrayRect, arrayPolar, calculate_end_point, HATCH_PATTERNS, LINETYPE_PRESETS,
   };
 }
