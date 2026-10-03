@@ -64,11 +64,15 @@ def main(argv):
             matplotlib.use("Agg")
             from ezdxf.addons.drawing import matplotlib as mpl
             mpl.qsave(doc.modelspace(), path[:-4] + ".png", bg="#FFFFFF", dpi=90)
+            for layout in doc.layouts:
+                if layout.name != "Model" and len(layout):
+                    mpl.qsave(layout, f"{path[:-4]}.{layout.name}.png", bg="#FFFFFF", dpi=90)
         counts = {}
         for e in doc.modelspace():
             counts[e.dxftype()] = counts.get(e.dxftype(), 0) + 1
         status = "FAIL" if errors else "ok  "
-        print(f"{status} {path}  {dict(sorted(counts.items()))}")
+        sheets = {l.name: len(l) for l in doc.layouts if l.name != "Model" and len(l)}
+        print(f"{status} {path}  {dict(sorted(counts.items()))}" + (f"  sheets: {sheets}" if sheets else ""))
         for e in errors:
             print(f"       {e}")
         failed += bool(errors)

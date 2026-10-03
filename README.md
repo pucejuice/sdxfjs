@@ -95,6 +95,20 @@ These match ezdxf's argument order where possible:
 - `scale` is DIMSCALE. Use 50 for a 1:50 drawing in mm.
 - `tickSize > 0` draws oblique ticks instead of arrows.
 
+### Paper-space sheets
+```js
+const sheet = d.addLayout('S-101', { paper: 'A1' });            // A0–A4 landscape, or size: [w, h]
+sheet.append(new Insert(titleBlock, [0, 0], { attributes: { 'dwg no': 'S-101', scale: '1:50' } }));
+sheet.addViewport({ center: [400, 320], size: [700, 480],       // on the sheet, in mm
+                    viewCenter: [3000, 1500], scale: 50,         // model point at the centre, 1:50
+                    freeze: ['DIMS'] });                         // layers hidden in this viewport only
+```
+- Paper coordinates are mm with (0, 0) at the sheet's lower-left corner (`units: 'in'` for inch sheets).
+- The first layout added is the active one. Each sheet gets AutoCAD's whole-sheet viewport automatically.
+- Plot setup: printer `DWG To PDF.pc3`, ISO full-bleed media (`mediaName` to override), 1:1.
+- Viewports are display-locked by default (`locked: false` to unlock). `vp.modelWindow` gives the model area shown.
+- Anything works on a sheet: title-block inserts with attributes, text, tables, dimensions, images.
+
 ### Groups
 ```js
 const g = d.addGroup('GRID A', [line1, line2], { description: 'grid line A', selectable: true });
@@ -175,6 +189,7 @@ sdxf.js only **writes** R2000 drawings, and is aimed at 2D drafting automation.
 - Linear, aligned, radius, diameter, angular and ordinate dimensions.
 - LEADER and MULTILEADER (MText or block content).
 - Linked raster images.
+- Paper-space sheets with scaled viewports and per-viewport frozen layers.
 - Tables, drawn from lines and text like ezdxf's table add-on.
 - Transforms and arrays.
 
@@ -184,7 +199,7 @@ sdxf.js only **writes** R2000 drawings, and is aimed at 2D drafting automation.
 
 | Feature | Effort |
 |---|---|
-| Paper-space layouts with viewports (drawing sheets) | M |
+| Non-rectangular (clipped) viewports, plot style tables | S–M |
 | R12 output | M |
 | AutoCAD's own TABLE entity (needs DXF 2004+; ezdxf can't create it either) | L |
 | 3D entities (3DFACE, MESH, polyface), ACIS solids | L |

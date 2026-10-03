@@ -1,7 +1,7 @@
 // node examples/beam_section.js  →  writes beam_section.dxf
 // RC beam section drawn from design inputs: hatch, bar layout, dimensions, notes.
 const fs = require('fs');
-const { Drawing, Layer, DimStyle, LwPolyLine, Line, Hatch, MText, LinearDimension, MLeader, Table } = require('../sdxf.js');
+const { Drawing, Layer, DimStyle, Block, AttDef, Insert, LwPolyLine, Line, Hatch, MText, LinearDimension, MLeader, Table } = require('../sdxf.js');
 
 // ── Design inputs (mm) ─────────────────────────────────────────────────────────
 const b = 300, h = 600, cover = 40, link = 10;
@@ -81,6 +81,20 @@ dwg.append(new MText(
   `Cover ${cover} mm, d = ${d} mm\n` +
   `As = ${As.toFixed(0)} mm², clear bar gap = ${clearGap.toFixed(0)} mm`,
   [0, -250, 0], { height: 25, width: 900, layer: 'TEXT' }));
+
+// ── A3 sheet: title block + 1:10 viewport fitted around the model ─────────────
+const title = new Block('a3_title', { entities: [
+  new LwPolyLine([[10, 10], [410, 10], [410, 287], [10, 287]], { flag: 1, lineWeight: 50 }),
+  new LwPolyLine([[290, 10], [410, 10], [410, 40], [290, 40]], { flag: 1 }),
+  new AttDef('title', [295, 30, 0], { height: 4 }),
+  new AttDef('dwg no', [295, 20, 0], { height: 3.5 }),
+  new AttDef('scale', [295, 13, 0], { height: 2.5 }),
+] });
+const sheet = dwg.addLayout('S-201', { paper: 'A3' });
+sheet.append(new Insert(title, [0, 0], { attributes: { title: 'BEAM B1 - SECTION A-A', 'dwg no': 'S-201', scale: '1:10' } }));
+const [[x0, y0], [x1, y1]] = dwg.extents(), pad = 100;
+sheet.addViewport({ center: [210, 160], size: [(x1 - x0 + 2 * pad) / 10, (y1 - y0 + 2 * pad) / 10],
+                    viewCenter: [(x0 + x1) / 2, (y0 + y1) / 2], scale: 10 });
 
 fs.writeFileSync('beam_section.dxf', dwg.toString());
 console.log(`wrote beam_section.dxf  (d = ${d} mm, As = ${As.toFixed(0)} mm²)`);

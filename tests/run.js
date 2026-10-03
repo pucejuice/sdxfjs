@@ -10,7 +10,7 @@ const {
   Drawing, Layer, LineType, DimStyle, Block, DynamicBlock, Insert, AttDef,
   Line, LwPolyLine, Circle, Arc, Ellipse, Spline, Point, Text, MText, Solid, Hatch, Leader,
   LinearDimension, AlignedDimension, RadiusDimension, DiameterDimension, AngularDimension,
-  OrdinateDimension, XLine, Ray, Wipeout, MLeader, Table, Image, ImageDef,
+  OrdinateDimension, XLine, Ray, Wipeout, MLeader, Table, Image, ImageDef, Layout,
   arrayRect, arrayPolar,
 } = X;
 
@@ -364,6 +364,35 @@ test('mleader_blocks', () => {
   const L = a._layout();
   close(L.scale, 50, 'block scaled by dimstyle'); closePt(L.box[0], [100 + L.dogleg, 3400 - 250], 'bubble left edge at landing end');
   assert.ok(s.includes('GRID_BUBBLE__REF-B') && s.includes('GRID_BUBBLE__REF-?'.replace('?', '_')), 'variant blocks written');
+  return d;
+});
+
+test('paper_space_sheets', () => {
+  const d = new Drawing({ units: 'mm', layers: [new Layer({ name: 'grid', color: 8, lineType: 'CENTER' }), new Layer({ name: 'dims', color: 2 })],
+                          dimstyles: [new DimStyle({ name: 'S50', scale: 50 })] });
+  // model: a 6 × 4 m frame
+  d.append(new LwPolyLine([[0, 0], [6000, 0], [6000, 4000], [0, 4000]], { flag: 1 }));
+  d.append(new Line([[3000, -500, 0], [3000, 4500, 0]], { layer: 'GRID' }));
+  d.append(new LinearDimension([0, 0], [6000, 0], [0, -800], { dimstyle: 'S50', layer: 'DIMS' }));
+  // title block drawn in paper mm
+  const title = new Block('a3_title', { entities: [
+    new LwPolyLine([[10, 10], [410, 10], [410, 287], [10, 287]], { flag: 1, lineWeight: 50 }),
+    new LwPolyLine([[290, 10], [410, 10], [410, 40], [290, 40]], { flag: 1 }),
+    new AttDef('dwg', [295, 28, 0], { height: 5 }), new AttDef('scale', [295, 16, 0], { height: 3.5 }),
+  ] });
+  const s1 = d.addLayout('S-101', { paper: 'A3' });
+  s1.append(new Insert(title, [0, 0], { attributes: { dwg: 'S-101', scale: '1:50' } }));
+  const vp = s1.addViewport({ center: [150, 160], size: [260, 200], viewCenter: [3000, 1800], scale: 50 });
+  closePt(vp.modelWindow[0], [3000 - 6500, 1800 - 5000], 'viewport model window');
+  const s2 = d.addLayout('S-102', { paper: 'A3' });
+  s2.append(new Insert(title, [0, 0], { attributes: { dwg: 'S-102', scale: '1:20' } }));
+  s2.addViewport({ center: [210, 150], size: [380, 250], viewCenter: [5000, 1000], scale: 20, freeze: ['DIMS'] });
+  s2.append(new MText('DETAIL AT CORNER', [20, 270, 0], { height: 5 }));
+  throws(() => d.addLayout('s-101'), /already exists/);
+  throws(() => d.addLayout('X', { paper: 'B7' }), /Unknown paper/);
+  const s = d.toString();
+  assert.ok(s.includes('*Paper_Space0') && s.includes('ACAD_LAYOUT'), 'second sheet block + layout dictionary');
+  assert.ok(s.includes('ISO_full_bleed_A3_(420.00_x_297.00_MM)'));
   return d;
 });
 

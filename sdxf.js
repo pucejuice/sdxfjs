@@ -31,7 +31,8 @@
  * Transforms on every entity: copy, translate, rotate, scale, mirror; arrayRect,
  * arrayPolar; MINSERT grids. Dynamic blocks: flip, visibility, array, lookups.
  * Groups, XLine/Ray, Wipeout, OrdinateDimension, MLeader (MULTILEADER, text or
- * block content), Table, Image/ImageDef (linked raster images).
+ * block content), Table, Image/ImageDef (linked raster images),
+ * paper-space sheets: Drawing.addLayout + Layout.addViewport.
  * Full API: README.md. Tests: npm test.
  *
  * Blocks & attributes:
@@ -81,6 +82,8 @@ let _owner = null;
 // Groups of the top-level entity being written: its model-space pieces get
 // ACAD_REACTORS to these groups and are recorded as members.
 let _groupCtx = null;
+// True while writing a paper-space layout: entities get group 67 = 1.
+let _paper = false;
 // Handles that MULTILEADER needs (set by Drawing.toString before the entities).
 let _H_MLSTYLE = null, _H_TEXTSTYLE = null, _H_LT_BYBLOCK = null;
 const DYN_APPID = 'SDXF_DYNBLOCK';
@@ -131,7 +134,9 @@ class Entity {
       lines.push('102', '{ACAD_REACTORS', ..._groupCtx.flatMap(g => ['330', g._handle]), '102', '}');
       _groupCtx.forEach(g => g._members.push(handle));
     }
-    lines.push('330', owner, '100', 'AcDbEntity', '8', parent.layer);
+    lines.push('330', owner, '100', 'AcDbEntity');
+    if (_paper) lines.push('67', '1');
+    lines.push('8', parent.layer);
     if (parent.lineType !== null) lines.push('6', parent.lineType);
     if (parent.color !== null && parent.color !== 256) lines.push('62', parent.color);
     if (parent.trueColor !== null && parent.trueColor !== undefined) lines.push('420', _rgb(parent.trueColor));
@@ -264,7 +269,7 @@ class Layer {
     this.lineWeight = lineWeight; this.plot = plot; this.trueColor = trueColor;
   }
   toString() {
-    const lines = ['0','LAYER','5',_nextHandle(),'330',_H_LAYER_TBL,
+    const lines = ['0','LAYER','5',this._handle = _nextHandle(),'330',_H_LAYER_TBL,
             '100','AcDbSymbolTableRecord','100','AcDbLayerTableRecord',
             '2',this.name,'70',this.flag,'62',this.color];
     if (this.trueColor !== null) lines.push('420', _rgb(this.trueColor));
@@ -495,7 +500,7 @@ class Insert extends Entity {
     lines.push(...this._extr(), ...this._dynXdata(), ...this._xdata());
     if (attribs.length) {
       for (const a of attribs) lines.push(a._toString(h));
-      lines.push('0','SEQEND','5',_nextHandle(),'330',h,'100','AcDbEntity','8',(this.parent || this).layer);
+      lines.push('0','SEQEND','5',_nextHandle(),'330',h,'100','AcDbEntity',...(_paper ? ['67', '1'] : []),'8',(this.parent || this).layer);
     }
     return lines.join(NL);
   }
@@ -1674,6 +1679,78 @@ class Table extends Entity {
   toString() { return this._entities().map(e => e.toString()).join(NL); }
 }
 
+// ── Paper space ───────────────────────────────────────────────────────────────
+// Landscape ISO sheets and their "DWG To PDF.pc3" media names
+const PAPER_SIZES = {
+  A0: [1189, 841], A1: [841, 594], A2: [594, 420], A3: [420, 297], A4: [297, 210],
+};
+/**
+ * Viewport on a layout: a window `size` = [w, h] (paper units) centred at
+ * `center` (paper), showing model space around `viewCenter` at `scale` model
+ * units per paper unit (e.g. 50 for 1:50 when both are mm).
+ * freeze: layer names hidden in this viewport only. locked: display locked.
+ */
+class Viewport extends Entity {
+  constructor({ center, size, viewCenter = [0, 0], scale = 1, freeze = [], locked = true, ...common } = {}) {
+    super({ layer: 'VIEWPORTS', ...common });
+    if (!center || !size) throw new Error('Viewport needs center and size');
+    if (!(scale > 0)) throw new Error('Viewport scale must be > 0');
+    this.center = center; this.size = size; this.viewCenter = viewCenter; this.scale = scale;
+    this.freeze = freeze.map(n => String(n).toUpperCase()); this.locked = locked;
+    this._id = null; this._overall = false;
+  }
+  _pts() { return [this.center]; }
+  _bbox() {
+    const [x, y] = this.center, [w, h] = this.size;
+    return [[x - w / 2, y - h / 2], [x + w / 2, y + h / 2]];
+  }
+  /** Model-space area shown: [[xmin,ymin],[xmax,ymax]]. */
+  get modelWindow() {
+    const [x, y] = this.viewCenter, w = this.size[0] * this.scale / 2, h = this.size[1] * this.scale / 2;
+    return [[x - w, y - h], [x + w, y + h]];
+  }
+  toString() {
+    const viewH = this._overall ? this.size[1] : this.size[1] * this.scale;
+    const lines = ['0','VIEWPORT',this._common(this._fixedHandle || _nextHandle()),'100','AcDbViewport',
+      _point([...this.center.slice(0, 2), 0]),'40',this.size[0],'41',this.size[1],'68',this._overall ? 1 : 2,'69',this._id,
+      '12',this.viewCenter[0],'22',this.viewCenter[1],'13','0','23','0','14','10','24','10','15','10','25','10',
+      '16','0','26','0','36','1','17','0','27','0','37','0','42','50','43','0','44','0','45',_num(viewH),
+      '50','0','51','0','72','100'];
+    for (const n of this.freeze) lines.push('331', this._layerHandles.get(n));
+    lines.push('90', this._overall ? 557088 : (this.locked ? 16384 : 0), '1', '', '281', '0', '71', '0', '74', '0',
+      '110','0','120','0','130','0','111','1','121','0','131','0','112','0','122','1','132','0','79','0','146','0');
+    return [...lines, ...this._xdata()].join(NL);
+  }
+}
+/**
+ * Paper-space sheet (Drawing.addLayout). Paper coordinates are in mm (or
+ * inches with units: 'in') with (0, 0) at the lower-left corner of the sheet.
+ *   const sheet = d.addLayout('S-101', { paper: 'A1' });
+ *   sheet.append(new Insert(titleBlock, [0, 0], { attributes: { ... } }));
+ *   sheet.addViewport({ center: [400, 320], size: [700, 480], viewCenter: [3000, 1500], scale: 50 });
+ */
+class Layout extends Collection {
+  constructor(name, { paper = 'A3', size = null, units = 'mm', margins = [0, 0, 0, 0], printer = 'DWG To PDF.pc3', mediaName = null } = {}) {
+    super();
+    this.name = String(name);
+    if (size === null) {
+      size = PAPER_SIZES[String(paper).toUpperCase()];
+      if (!size) throw new Error(`Unknown paper '${paper}'. Use ${Object.keys(PAPER_SIZES).join(', ')} or size: [w, h]`);
+    }
+    if (!['mm', 'in'].includes(units)) throw new Error(`Layout units must be 'mm' or 'in'`);
+    this.size = size; this.units = units; this.margins = margins; this.printer = printer;
+    const mm = units === 'in' ? 25.4 : 1, [w, h] = size.map(v => (v * mm).toFixed(2));
+    const iso = size === PAPER_SIZES[String(paper).toUpperCase()] && units === 'mm';
+    this.mediaName = mediaName || (iso ? `ISO_full_bleed_${String(paper).toUpperCase()}_(${w}_x_${h}_MM)` : `USER_(${w}_x_${h}_MM)`);
+    this.viewports = [];
+  }
+  addViewport(options) {
+    const v = new Viewport(options);
+    this.viewports.push(v); this.append(v);
+    return v;
+  }
+}
+
 // ── Group ─────────────────────────────────────────────────────────────────────
 /** Named selection group of model-space entities (Drawing.addGroup). */
 class Group {
@@ -1734,7 +1811,7 @@ class Drawing extends Collection {
     this.insbase = insbase; this.extmin = extmin; this.extmax = extmax;
     this.layers = [...layers]; this.linetypes = [...linetypes]; this.styles = [...styles];
     this.dimstyles = [...dimstyles]; this.views = [...views]; this.blocks = [...blocks];
-    this.units = units; this.ltscale = ltscale; this.wipeoutFrame = wipeoutFrame; this.groups = [];
+    this.units = units; this.ltscale = ltscale; this.wipeoutFrame = wipeoutFrame; this.groups = []; this.layouts = [];
     if (!this.dimstyles.some(s => s.name.toUpperCase() === 'STANDARD')) this.dimstyles.unshift(new DimStyle());
   }
   /** Create a named group of entities that are (or will be) in this drawing's model space. */
@@ -1744,6 +1821,16 @@ class Drawing extends Collection {
     this.groups.push(g);
     return g;
   }
+  /** Add a paper-space sheet; the first one added is the active layout. */
+  addLayout(name, options = {}) {
+    if (/^model$/i.test(name) || this.layouts.some(l => l.name.toUpperCase() === String(name).toUpperCase()))
+      throw new Error(`Layout '${name}' already exists`);
+    const l = new Layout(name, options);
+    this.layouts.push(l);
+    return l;
+  }
+  // Model-space and paper-space top-level entities
+  _top() { return [...this.entities, ...this.layouts.flatMap(l => l.entities)]; }
   /** Approximate [[xmin,ymin],[xmax,ymax]] of model space (call after adding entities). */
   extents() {
     this._collectBlocks();   // dimensions need their geometry for an accurate box
@@ -1757,9 +1844,11 @@ class Drawing extends Collection {
   }
   // Add mandatory table records, presets and layers that entities reference.
   _resolveTables(blocks) {
-    const ents = [...this.entities, ...blocks.flatMap(b => b.entities)];
+    const ents = [...this._top(), ...blocks.flatMap(b => b.entities)];
     const has = (list, n) => list.some(x => x.name.toUpperCase() === String(n).toUpperCase());
     if (!has(this.layers, '0')) this.layers.unshift(new Layer({ name: '0', color: 7 }));
+    for (const v of this.layouts.flatMap(l => l.viewports))
+      for (const n of v.freeze) if (!has(this.layers, n)) this.layers.push(new Layer({ name: n, color: 7 }));
     for (const e of ents) {
       const l = (e.parent || e).layer;
       if (l && !has(this.layers, l)) this.layers.push(new Layer({ name: String(l), color: 7 }));
@@ -1819,7 +1908,7 @@ class Drawing extends Collection {
       }
     };
     this.blocks.forEach(add);
-    this.entities.forEach(visit);
+    this._top().forEach(visit);
     return out;
   }
   _appids(blocks) {
@@ -1828,7 +1917,7 @@ class Drawing extends Collection {
       if (e.xdata) Object.keys(e.xdata).forEach(k => ids.add(k.toUpperCase()));
       if (e instanceof Insert && e.params) ids.add(DYN_APPID);
     };
-    this.entities.forEach(scan);
+    this._top().forEach(scan);
     blocks.forEach(b => b.entities.forEach(scan));
     return [...ids];
   }
@@ -1843,9 +1932,21 @@ class Drawing extends Collection {
     const extmin = this.extmin || auto[0], extmax = this.extmax || auto[1];
     const H_ROOTDICT = _nextHandle(), H_GROUPDICT = _nextHandle();
     // Optional objects / classes, only when something uses them
-    const used = cls => [...this.entities, ...userBlocks.flatMap(b => b.entities)].some(e => e instanceof cls);
+    const used = cls => [...this._top(), ...userBlocks.flatMap(b => b.entities)].some(e => e instanceof cls);
     const hasWipeout = used(Wipeout), hasMLeader = used(MLeader);
-    const images = [...this.entities, ...userBlocks.flatMap(b => b.entities)].filter(e => e instanceof Image);
+    const images = [...this._top(), ...userBlocks.flatMap(b => b.entities)].filter(e => e instanceof Image);
+    // Paper-space layouts: LAYOUT objects, block records, overall viewports (ID 1)
+    const hasLayouts = this.layouts.length > 0;
+    const [H_LAYOUTDICT, H_MODEL_LAYOUT] = hasLayouts ? [_nextHandle(), _nextHandle()] : [null, null];
+    this.layouts.forEach((l, i) => {
+      l._handle = _nextHandle();
+      l._btr = i === 0 ? _H_PAPER_BTR : _nextHandle();
+      l._blockName = i === 0 ? '*Paper_Space' : `*Paper_Space${i - 1}`;
+      const [w, h] = l.size;
+      l._overall = Object.assign(new Viewport({ center: [w / 2, h / 2], size: [w * 1.1, h * 1.1], viewCenter: [w / 2, h / 2], layer: '0' }),
+                                 { _overall: true, _fixedHandle: _nextHandle(), _id: 1 });
+      l.viewports.forEach((v, k) => { v._id = k + 2; });
+    });
     const imageDefs = [...new Set(images.map(i => i.imageDef))];
     const [H_IMGDICT, H_RASTERVARS] = images.length ? [_nextHandle(), _nextHandle()] : [null, null];
     imageDefs.forEach(d => { d._handle = _nextHandle(); d._reactors = []; });
@@ -1863,12 +1964,13 @@ class Drawing extends Collection {
     }
 
     // ── TABLES ──────────────────────────────────────────────────
-    const btr = (h, name) => ['0','BLOCK_RECORD','5',h,'330',_H_BLOCKTABLE,
+    const btr = (h, name, layout = null) => ['0','BLOCK_RECORD','5',h,'330',_H_BLOCKTABLE,
        '100','AcDbSymbolTableRecord','100','AcDbBlockTableRecord',
-       '2',name,'70','0','280','1','281','0'].join(NL);
+       '2',name,...(layout ? ['340', layout] : []),'70','0','280','1','281','0'].join(NL);
     const brDefs = [
-      btr(_H_MODEL_BTR, '*Model_Space'),
-      btr(_H_PAPER_BTR, '*Paper_Space'),
+      btr(_H_MODEL_BTR, '*Model_Space', H_MODEL_LAYOUT),
+      btr(_H_PAPER_BTR, '*Paper_Space', hasLayouts ? this.layouts[0]._handle : null),
+      ...this.layouts.slice(1).map(l => btr(l._btr, l._blockName, l._handle)),
       ...userBlocks.map(b => btr(b._btrHandle, b.name.toUpperCase())),
     ];
     const brTable = ['0','TABLE','2','BLOCK_RECORD','5',_H_BLOCKTABLE,'330','0',
@@ -1905,12 +2007,15 @@ class Drawing extends Collection {
     const std = this.styles.find(s => s.name === 'STANDARD') || this.styles[0];
     _H_TEXTSTYLE = std._handle;
     _H_LT_BYBLOCK = this.linetypes.find(l => l.name === 'BYBLOCK')._handle;
+    const layerHandles = new Map(this.layers.map(l => [l.name, l._handle]));
+    this.layouts.forEach(l => l.viewports.forEach(v => { v._layerHandles = layerHandles; }));
 
     // ── CLASSES — custom objects used by this drawing ────────────
     const classDefs = [
       ...(hasWipeout ? [['WIPEOUTVARIABLES', 'AcDbWipeoutVariables', 'WipeOut', 0, 0], ['WIPEOUT', 'AcDbWipeout', 'WipeOut', 127, 1]] : []),
       ...(images.length ? [['RASTERVARIABLES', 'AcDbRasterVariables', 'ISM', 0, 0], ['IMAGE', 'AcDbRasterImage', 'ISM', 2175, 1],
                            ['IMAGEDEF', 'AcDbRasterImageDef', 'ISM', 0, 0], ['IMAGEDEF_REACTOR', 'AcDbRasterImageDefReactor', 'ISM', 1, 0]] : []),
+      ...(hasLayouts ? [['LAYOUT', 'AcDbLayout', 'ObjectDBX Classes', 0, 0]] : []),
       ...(hasMLeader ? [['MLEADERSTYLE', 'AcDbMLeaderStyle', 'ACDB_MLEADERSTYLE_CLASS', 4095, 0], ['MULTILEADER', 'AcDbMLeader', 'ACDB_MLEADER_CLASS', 3071, 1]] : []),
     ].map(([n, cpp, app, flags, isEnt]) => ['0','CLASS','1',n,'2',cpp,'3',app,'90',flags,'280','0','281',isEnt].join(NL));
     const classes = classDefs.length ? this._section('classes', classDefs) : null;
@@ -1926,14 +2031,26 @@ class Drawing extends Collection {
       '100','AcDbBlockBegin','2','*Paper_Space','70','0',_point([0,0,0]),'3','*Paper_Space','1','',
       '0','ENDBLK','5',_nextHandle(),'330',_H_PAPER_BTR,'100','AcDbEntity','8','0','100','AcDbBlockEnd',
     ].join(NL);
-    const blocks = this._section('blocks', [modelBlock, paperBlock, ...userBlocks.map(x => x.toString())]);
+    // Paper-space entities: the first layout's go in ENTITIES, the others' in their *Paper_SpaceN block
+    const writeLayout = l => {
+      const prev = _owner; _owner = l._btr; _paper = true;
+      try { return [l._overall, ...l.entities].map(e => e.toString()).filter(s => s && s.trim()); }
+      finally { _owner = prev; _paper = false; }
+    };
+    const otherSheets = this.layouts.slice(1).map(l => [
+      '0','BLOCK','5',_nextHandle(),'330',l._btr,'100','AcDbEntity','67','1','8','0',
+      '100','AcDbBlockBegin','2',l._blockName,'70','0',_point([0,0,0]),'3',l._blockName,'1','',
+      ...writeLayout(l),
+      '0','ENDBLK','5',_nextHandle(),'330',l._btr,'100','AcDbEntity','67','1','8','0','100','AcDbBlockEnd',
+    ].join(NL));
+    const blocks = this._section('blocks', [modelBlock, paperBlock, ...otherSheets, ...userBlocks.map(x => x.toString())]);
 
     // ── ENTITIES ─────────────────────────────────────────────────
     _owner = _H_MODEL_BTR;
     const entities = this._section('entities', this.entities.map(e => {
       _groupCtx = groupOf.get(e) || null;
       try { return e.toString(); } finally { _groupCtx = null; }
-    }));
+    }).concat(hasLayouts ? writeLayout(this.layouts[0]) : []));
     _owner = null;
 
     // ── OBJECTS — root dictionary required for AC1015 ────────────
@@ -1942,6 +2059,7 @@ class Drawing extends Collection {
     if (hasMLeader) rootEntries.push(['ACAD_MLEADERSTYLE', H_MLSDICT]);
     if (hasWipeout) rootEntries.push(['ACAD_WIPEOUT_VARS', H_WOVARS]);
     if (images.length) rootEntries.push(['ACAD_IMAGE_DICT', H_IMGDICT], ['ACAD_IMAGE_VARS', H_RASTERVARS]);
+    if (hasLayouts) rootEntries.push(['ACAD_LAYOUT', H_LAYOUTDICT]);
     const objectDefs = [
       ['0','DICTIONARY','5',H_ROOTDICT,'330','0','100','AcDbDictionary','281','1',
        ...rootEntries.flatMap(([k, h]) => ['3', k, '350', h])].join(NL),
@@ -1976,6 +2094,31 @@ class Drawing extends Collection {
           '1',d.filename,'10',d.size[0],'20',d.size[1],'11','0.01','21','0.01','280','1','281','0'].join(NL)),
         ...images.map(i => ['0','IMAGEDEF_REACTOR','5',i._reactor,'330',i._handle,'100','AcDbRasterImageDefReactor','90','2','330',i._handle].join(NL)));
     }
+    if (hasLayouts) {
+      // PLOTSETTINGS + LAYOUT data (values as AutoCAD / ezdxf write them)
+      const plot = ({ printer, media, margins, size, inch }) => ['100','AcDbPlotSettings','1','','2',printer,'4',media,'6','',
+        '40',margins[0],'41',margins[1],'42',margins[2],'43',margins[3],'44',size[0],'45',size[1],
+        '46','0','47','0','48','0','49','0','140','0','141','0','142','1','143','1',
+        '70',printer ? 672 : 1024,'72',inch ? 0 : 1,'73','0','74','5','7','','75','16','76','0','77','2','78','300',
+        '147','1','148','0','149','0'];
+      const layout = (name, tab, limits, btrH, vpH) => ['100','AcDbLayout','1',name,'70','1','71',tab,
+        '10',limits[0][0],'20',limits[0][1],'11',limits[1][0],'21',limits[1][1],'12','0','22','0','32','0',
+        '14','1e+20','24','1e+20','34','1e+20','15','-1e+20','25','-1e+20','35','-1e+20','146','0',
+        '13','0','23','0','33','0','16','1','26','0','36','0','17','0','27','1','37','0','76','1','330',btrH,
+        ...(vpH ? ['331', vpH] : [])];
+      objectDefs.push(
+        ['0','DICTIONARY',...owned(H_LAYOUTDICT, H_ROOTDICT),'100','AcDbDictionary','281','1',
+         '3','Model','350',H_MODEL_LAYOUT,...this.layouts.flatMap(l => ['3', l.name, '350', l._handle])].join(NL),
+        ['0','LAYOUT',...owned(H_MODEL_LAYOUT, H_LAYOUTDICT),
+         ...plot({ printer: '', media: 'ISO_full_bleed_A3_(420.00_x_297.00_MM)', margins: [0, 0, 0, 0], size: [420, 297] }),
+         ...layout('Model', 0, [[0, 0], [420, 297]], _H_MODEL_BTR, null)].join(NL),
+        ...this.layouts.map((l, i) => {
+          const mm = l.units === 'in' ? 25.4 : 1;
+          return ['0','LAYOUT',...owned(l._handle, H_LAYOUTDICT),
+            ...plot({ printer: l.printer, media: l.mediaName, margins: l.margins, size: l.size.map(v => v * mm), inch: l.units === 'in' }),
+            ...layout(l.name, i + 1, [[0, 0], l.size], l._btr, l._overall._fixedHandle)].join(NL);
+        }));
+    }
     const objects = this._section('objects', objectDefs);
     _H_MLSTYLE = null;
 
@@ -2006,7 +2149,7 @@ if (typeof module !== 'undefined' && module.exports) {
     LinearParameter, FlipParameter, VisibilityParameter,
     Line, LwPolyLine, Circle, Arc, Ellipse, Spline, Point, Text, MText, Solid, Hatch, Leader,
     Dimension, LinearDimension, AlignedDimension, RadiusDimension, DiameterDimension, AngularDimension,
-    OrdinateDimension, XLine, Ray, Wipeout, MLeader, Table, Group, Image, ImageDef,
+    OrdinateDimension, XLine, Ray, Wipeout, MLeader, Table, Group, Image, ImageDef, Layout, Viewport, PAPER_SIZES,
     Collection, Entity, arrayRect, arrayPolar, calculate_end_point, HATCH_PATTERNS, LINETYPE_PRESETS,
   };
 }
