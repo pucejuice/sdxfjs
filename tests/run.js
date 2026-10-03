@@ -10,7 +10,7 @@ const {
   Drawing, Layer, LineType, DimStyle, Block, DynamicBlock, Insert, AttDef,
   Line, LwPolyLine, Circle, Arc, Ellipse, Spline, Point, Text, MText, Solid, Hatch, Leader,
   LinearDimension, AlignedDimension, RadiusDimension, DiameterDimension, AngularDimension,
-  OrdinateDimension, XLine, Ray, Wipeout, MLeader, Table,
+  OrdinateDimension, XLine, Ray, Wipeout, MLeader, Table, Image, ImageDef,
   arrayRect, arrayPolar,
 } = X;
 
@@ -298,6 +298,72 @@ test('tables', () => {
   throws(() => new Table([0, 0], [['a', { text: 'b', rowspan: 2 }], [{ text: 'c', colspan: 2 }]]), /covered/);
   const ragged = new Table([0, 0], [['a', 'b', 'c'], ['d']])._grid();
   assert.strictEqual(ragged.cells.length, 6, 'short row padded with empty cells');
+  return d;
+});
+
+// Minimal valid RGB PNG (w × h gradient) for the image tests
+function makePng(w, h) {
+  const zlib = require('zlib');
+  const crc = buf => { let c, k = ~0; for (const b of buf) { c = (k ^ b) & 0xFF; for (let i = 0; i < 8; i++) c = c & 1 ? 0xEDB88320 ^ (c >>> 1) : c >>> 1; k = (k >>> 8) ^ c; } return ~k >>> 0; };
+  const chunk = (type, data) => {
+    const len = Buffer.alloc(4); len.writeUInt32BE(data.length);
+    const td = Buffer.concat([Buffer.from(type), data]), c = Buffer.alloc(4); c.writeUInt32BE(crc(td));
+    return Buffer.concat([len, td, c]);
+  };
+  const ihdr = Buffer.alloc(13); ihdr.writeUInt32BE(w, 0); ihdr.writeUInt32BE(h, 4); ihdr[8] = 8; ihdr[9] = 2;
+  const raw = Buffer.alloc((w * 3 + 1) * h);
+  for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) {
+    const o = y * (w * 3 + 1) + 1 + x * 3; raw[o] = x * 255 / w; raw[o + 1] = y * 255 / h; raw[o + 2] = 160;
+  }
+  return Buffer.concat([Buffer.from([0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A]), chunk('IHDR', ihdr),
+                        chunk('IDAT', zlib.deflateSync(raw)), chunk('IEND', Buffer.alloc(0))]);
+}
+
+test('images', () => {
+  fs.writeFileSync(path.join(OUT, 'gradient.png'), makePng(64, 32));
+  const def = ImageDef.fromFile(path.join(OUT, 'gradient.png'), 'gradient.png');
+  assert.deepStrictEqual(def.size, [64, 32]);
+  const gif = Uint8Array.from([0x47, 0x49, 0x46, 0x38, 0x39, 0x61, 10, 0, 20, 0, 0, 0]);
+  assert.deepStrictEqual(ImageDef.fromBytes('a.gif', gif).size, [10, 20]);
+  const bmp = new Uint8Array(30); bmp[0] = 0x42; bmp[1] = 0x4D; bmp[18] = 100; bmp[22] = 50;
+  assert.deepStrictEqual(ImageDef.fromBytes('a.bmp', bmp).size, [100, 50]);
+  const jpg = Uint8Array.from([0xFF, 0xD8, 0xFF, 0xE0, 0, 4, 0, 0, 0xFF, 0xC0, 0, 17, 8, 0, 200, 1, 44, 3, 0, 0, 0]);
+  assert.deepStrictEqual(ImageDef.fromBytes('a.jpg', jpg).size, [300, 200]);
+  throws(() => ImageDef.fromBytes('x.txt', Uint8Array.from([1, 2, 3])), /not a PNG/);
+
+  const d = new Drawing({ units: 'mm' });
+  const a = new Image(def, [0, 0, 0], { width: 640 });
+  close(a.height, 320, 'height from aspect');
+  d.append(a);
+  d.append(new Image(def, [800, 0, 0], { height: 200, rotation: 30 }));
+  d.append(new Image(def, [0, -400, 0], { width: 320 }).mirror([0, -300], [1, -300]));
+  const blk = new Block('logo', { entities: [new Image(def, [0, 0, 0], { width: 100 })] });
+  d.append(new Insert(blk, [1500, 0, 0]));
+  const s = d.toString();
+  assert.ok(s.includes('ACAD_IMAGE_DICT') && s.includes('IMAGEDEF_REACTOR') && s.includes('\ngradient.png\n'));
+  assert.strictEqual((s.match(/\n0\nIMAGEDEF\n/g) || []).length, 1, 'one IMAGEDEF shared by all images');
+  return d;
+});
+
+test('mleader_blocks', () => {
+  const bubble = new Block('grid_bubble', { entities: [
+    new Circle([0, 0, 0], 5), new AttDef('ref', [0, 0, 0], { height: 4, align: 'MIDDLE_CENTER', defaultValue: '?' }),
+  ] });
+  const d = new Drawing({ units: 'mm', dimstyles: [new DimStyle({ name: 'S50', scale: 50 })] });
+  d.append(new Line([[0, 0, 0], [0, 3000, 0]]));
+  d.append(new Line([[3000, 0, 0], [3000, 3000, 0]]));
+  const a = new MLeader([[0, 3000], [0, 3400], [100, 3400]], { block: bubble, attributes: { ref: 'A' } }, { dimstyle: 'S50' });
+  const b = new MLeader([[3000, 3000], [3000, 3400], [2900, 3400]], { block: bubble, attributes: { ref: 'B' } }, { dimstyle: 'S50' });
+  const c = new MLeader([[1500, 0], [1500, -500]], bubble, { dimstyle: 'S50' });
+  [a, b, c].forEach(x => d.append(x));
+  assert.strictEqual(a.block.name, 'GRID_BUBBLE__REF-A');
+  assert.strictEqual(new MLeader([[0, 0], [1, 1]], { block: bubble, attributes: { ref: 'A' } }).block, a.block, 'variant reused');
+  assert.ok(a.block.entities.some(e => e instanceof Text && e.text === 'A'), 'attribute baked into text');
+  throws(() => new MLeader([[0, 0], [1, 1]], { block: bubble, attributes: { nope: 1 } }), /NOPE/);
+  const s = d.toString();   // resolves the 'S50' dimstyle
+  const L = a._layout();
+  close(L.scale, 50, 'block scaled by dimstyle'); closePt(L.box[0], [100 + L.dogleg, 3400 - 250], 'bubble left edge at landing end');
+  assert.ok(s.includes('GRID_BUBBLE__REF-B') && s.includes('GRID_BUBBLE__REF-?'.replace('?', '_')), 'variant blocks written');
   return d;
 });
 

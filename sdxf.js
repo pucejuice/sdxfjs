@@ -30,7 +30,8 @@
  * Ellipse, Spline (control or fit points), Leader, Radius/Diameter/AngularDimension.
  * Transforms on every entity: copy, translate, rotate, scale, mirror; arrayRect,
  * arrayPolar; MINSERT grids. Dynamic blocks: flip, visibility, array, lookups.
- * Groups, XLine/Ray, Wipeout, OrdinateDimension, MLeader (MULTILEADER), Table.
+ * Groups, XLine/Ray, Wipeout, OrdinateDimension, MLeader (MULTILEADER, text or
+ * block content), Table, Image/ImageDef (linked raster images).
  * Full API: README.md. Tests: npm test.
  *
  * Blocks & attributes:
@@ -1359,24 +1360,62 @@ class Wipeout extends Entity {
 
 // ── Multileader ───────────────────────────────────────────────────────────────
 /**
- * MULTILEADER with MText content. `points` run from the arrow tip to the
- * connection point; a horizontal landing (dogleg) and the text follow, on the
- * side the last segment points to.
+ * Block with its non-constant AttDefs turned into fixed Text, one block per set
+ * of values (R2000 MULTILEADERs cannot carry attribute values).
+ */
+function _attribVariant(block, values) {
+  const vals = Object.fromEntries(Object.entries(values || {}).map(([k, v]) => [_tag(k), String(v)]));
+  const tags = new Set(block.attdefs.map(a => a.tag));
+  const bad = Object.keys(vals).filter(t => !tags.has(t));
+  if (bad.length) throw new Error(`Block '${block.name}' has no attribute(s) ${bad.join(', ')}. Valid: ${[...tags].join(', ') || '(none)'}`);
+  if (!block.attdefs.length) return block;
+  const used = block.attdefs.filter(a => !(a.flags & 1)).map(a => [a.tag, vals[a.tag] ?? a.defaultValue]);
+  const name = block.name.toUpperCase() + used.map(([t, v]) => `__${t}-${_key(v)}`).join('');
+  block._attVariants = block._attVariants || new Map();
+  if (block._attVariants.has(name)) return block._attVariants.get(name);
+  const ents = block.entities.flatMap(e => {
+    if (!(e instanceof AttDef)) return [e];
+    if (e.flags & 1) return [];   // invisible
+    const t = new Text(vals[e.tag] ?? e.defaultValue, e.point, { height: e.height, rotation: e.rotation, style: e.style,
+      align: e.align, alignPoint: e.alignPoint, layer: e.layer, color: e.color });
+    return [t];
+  });
+  const v = new Block(name, { layer: block.layer, base: block.base, entities: ents });
+  block._attVariants.set(name, v);
+  return v;
+}
+
+/**
+ * MULTILEADER. `points` run from the arrow tip to the connection point; a
+ * horizontal landing (dogleg) and the content follow, on the side the last
+ * segment points to. Content is MText or a block:
  *   new MLeader([[0,0],[300,400]], 'T16 @ 200 B1', { dimstyle: 'S50' })
+ *   new MLeader([[0,0],[300,400]], { block: bubble, attributes: { NUM: 'A' } }, { dimstyle: 'S50' })
  * Sizes default from the dimstyle (× its scale): text height, arrow size, gap;
  * dogleg = 2 × arrow size. Giving `height` scales arrow, gap and dogleg with it.
+ * A block is drawn at its own size × the same factor (or `blockScale`), centred
+ * on the end of the landing (like AutoCAD's "center extents" connection).
  */
 class MLeader extends Entity {
-  constructor(points, text, { dimstyle = 'Standard', height = null, arrowSize = null, dogleg = null, gap = null, ...common } = {}) {
+  constructor(points, content, { dimstyle = 'Standard', height = null, arrowSize = null, dogleg = null, gap = null,
+                                 blockScale = null, ...common } = {}) {
     super(common);
     if (!points || points.length < 2) throw new Error('MLeader needs at least 2 points (arrow tip … connection point)');
-    if (text === null || text === undefined || String(text) === '') throw new Error('MLeader needs text');
-    this.points = points; this.text = String(text); this.dimstyle = dimstyle;
+    if (content instanceof Block) content = { block: content };
+    if (content && typeof content === 'object') {
+      if (!(content.block instanceof Block)) throw new Error('MLeader block content needs { block: Block, attributes? }');
+      this.block = _attribVariant(content.block, content.attributes);
+      this.text = null;
+    } else {
+      if (content === null || content === undefined || String(content) === '') throw new Error('MLeader needs text or a block');
+      this.text = String(content); this.block = null;
+    }
+    this.points = points; this.dimstyle = dimstyle; this.blockScale = blockScale;
     this.height = height; this.arrowSize = arrowSize; this.dogleg = dogleg; this.gap = gap; this._style = null;
   }
   _pts() { return this.points; }
   _transformExtra(info) {
-    for (const k of ['height', 'arrowSize', 'dogleg', 'gap']) if (this[k] !== null) this[k] *= info.s;
+    for (const k of ['height', 'arrowSize', 'dogleg', 'gap', 'blockScale']) if (this[k] !== null) this[k] *= info.s;
   }
   _layout() {
     const st = this._style || (this.dimstyle instanceof DimStyle ? this.dimstyle : new DimStyle());
@@ -1386,34 +1425,141 @@ class MLeader extends Entity {
     const dogleg = this.dogleg ?? 2 * st.arrowSize * k, gap = this.gap ?? st.gap * k;
     const n = this.points.length, conn = this.points[n - 1], prev = this.points[n - 2];
     const right = conn[0] >= prev[0];
-    const rows = this.text.split('\n');
-    const w = Math.max(...rows.map(r => r.length)) * h * 0.9;   // estimate; AutoCAD re-measures
-    const tx = right ? conn[0] + dogleg + gap : conn[0] - dogleg - gap - w;
-    return { h, arrow, dogleg, gap, conn, right, w, rows, tx, top: conn[1] + h / 2 };
+    const end = [conn[0] + (right ? dogleg : -dogleg), conn[1]];   // end of the landing
+    const L = { h, arrow, dogleg, gap, conn, right, end };
+    if (this.block) {
+      const s = this.blockScale ?? k, b = this.block._bbox() || [this.block.base, this.block.base];
+      const hw = (b[1][0] - b[0][0]) / 2 * s, ce = [(b[0][0] + b[1][0]) / 2, (b[0][1] + b[1][1]) / 2];
+      const center = [end[0] + (right ? hw : -hw), end[1]];
+      L.scale = s;
+      L.position = [center[0] - (ce[0] - this.block.base[0]) * s, center[1] - (ce[1] - this.block.base[1]) * s];
+      L.box = [[center[0] - hw, center[1] - (b[1][1] - b[0][1]) / 2 * s], [center[0] + hw, center[1] + (b[1][1] - b[0][1]) / 2 * s]];
+    } else {
+      L.rows = this.text.split('\n');
+      L.w = Math.max(...L.rows.map(r => r.length)) * h * 0.9;   // estimate; AutoCAD re-measures
+      L.tx = right ? end[0] + gap : end[0] - gap - L.w;
+      L.top = conn[1] + h / 2;
+      L.box = [[L.tx, L.top - L.rows.length * h * 1.67], [L.tx + L.w, L.top]];
+    }
+    return L;
   }
-  _bbox() {
-    const L = this._layout();
-    return _union([_bboxOf(this.points), [[L.tx, L.top - L.rows.length * L.h * 1.67], [L.tx + L.w, L.top]]]);
-  }
+  _bbox() { return _union([_bboxOf(this.points), this._layout().box]); }
   toString() {
     if (!_H_MLSTYLE) throw new Error('MLeader must be written through a Drawing');
+    if (this.block && !this.block._btrHandle) throw new Error('MLeader block is not part of the drawing');
     const L = this._layout(), [cx, cy] = L.conn, BYBLOCK = '-1056964608';
     const lines = ['0','MULTILEADER',this._common(),'100','AcDbMLeader','270','2',
-      '300','CONTEXT_DATA{','40','1','10',_num(L.tx - L.gap),'20',cy,'30','0','41',L.h,'140',L.arrow,'145',L.gap,
-      '174','1','175','1','176','0','177','0','290','1','304',this.text.replace(/\r?\n/g, '\\P'),
-      '11','0','21','0','31','1','340',_H_TEXTSTYLE,'12',_num(L.tx),'22',_num(L.top),'32','0',
-      '13','1','23','0','33','0','42','0','43','0','44','0','45','1','170','1','90',BYBLOCK,'171','1','172','1',
-      '91','-939524096','141','1.5','92','0','291','0','292','0','173','0','293','0','142','0','143','0',
-      '294','0','295','1','296','0','110','0','120','0','130','0','111','1','121','0','131','0',
-      '112','0','122','1','132','0','297','0',
+      '300','CONTEXT_DATA{','40','1','10',_num(L.end[0]),'20',cy,'30','0','41',L.h,'140',L.arrow,'145',L.gap,
+      '174','1','175','1','176','0','177','0'];
+    if (this.block) {
+      const s = _num(L.scale);
+      lines.push('290','0','296','1','341',this.block._btrHandle,'14','0','24','0','34','1',
+        '15',_num(L.position[0]),'25',_num(L.position[1]),'35','0','16',s,'26',s,'36',s,'46','0','93',BYBLOCK,
+        ...[1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1].flatMap(v => ['47', v]));   // matrix: unused by AutoCAD/BricsCAD
+    } else {
+      lines.push('290','1','304',this.text.replace(/\r?\n/g, '\\P'),
+        '11','0','21','0','31','1','340',_H_TEXTSTYLE,'12',_num(L.tx),'22',_num(L.top),'32','0',
+        '13','1','23','0','33','0','42','0','43','0','44','0','45','1','170','1','90',BYBLOCK,'171','1','172','1',
+        '91','-939524096','141','1.5','92','0','291','0','292','0','173','0','293','0','142','0','143','0',
+        '294','0','295','1','296','0');
+    }
+    lines.push('110','0','120','0','130','0','111','1','121','0','131','0','112','0','122','1','132','0','297','0',
       '302','LEADER{','290','1','291','1','10',cx,'20',cy,'30','0','11',L.right ? 1 : -1,'21','0','31','0',
-      '90','0','40',L.dogleg,'304','LEADER_LINE{'];
+      '90','0','40',L.dogleg,'304','LEADER_LINE{');
     this.points.slice(0, -1).forEach(p => lines.push(_point(_xyz(p))));
     lines.push('91','0','92',BYBLOCK,'305','}','303','}','301','}',
       '340',_H_MLSTYLE,'90','2147483647','170','1','91',BYBLOCK,'341',_H_LT_BYBLOCK,'171','-2',
-      '290','1','291','1','41',L.dogleg,'42',L.arrow,'172','2','343',_H_TEXTSTYLE,'173','1','95','1',
-      '174','1','175','0','92',BYBLOCK,'292','0','93',BYBLOCK,'10','1','20','1','30','1','43','0','176','0','293','0');
+      '290','1','291','1','41',L.dogleg,'42',L.arrow,'172',this.block ? 1 : 2,'343',_H_TEXTSTYLE,'173','1','95','1',
+      '174','1','175','0','92',BYBLOCK,'292','0');
+    if (this.block) lines.push('344', this.block._btrHandle, '93', BYBLOCK, '10', _num(L.scale), '20', _num(L.scale), '30', _num(L.scale));
+    else lines.push('93', BYBLOCK, '10', '1', '20', '1', '30', '1');
+    lines.push('43','0','176','0','293','0');
     return [...lines, ...this._xdata()].join(NL);
+  }
+}
+
+// ── Raster images ─────────────────────────────────────────────────────────────
+/**
+ * Image file reference (the file is linked, not embedded: keep it next to the
+ * DXF or give a full path). Pixel size is needed for the aspect ratio:
+ *   new ImageDef('site_plan.png', [1920, 1080])
+ *   ImageDef.fromFile('site_plan.png')          // Node: reads PNG/JPEG/GIF/BMP header
+ *   ImageDef.fromBytes('site_plan.png', bytes)  // browser: from a Uint8Array
+ */
+class ImageDef {
+  constructor(filename, sizePx) {
+    if (!filename) throw new Error('ImageDef needs a filename');
+    if (!sizePx || !(sizePx[0] > 0 && sizePx[1] > 0)) throw new Error('ImageDef needs the image size in pixels [width, height]');
+    this.filename = String(filename); this.size = [sizePx[0], sizePx[1]];
+  }
+  static fromBytes(filename, bytes) {
+    const size = _imageSize(bytes);
+    if (!size) throw new Error(`${filename}: not a PNG, JPEG, GIF or BMP file (or header unreadable)`);
+    return new ImageDef(filename, size);
+  }
+  static fromFile(path, filename = path) {
+    const fs = require('fs');
+    return ImageDef.fromBytes(filename, new Uint8Array(fs.readFileSync(path)));
+  }
+}
+function _imageSize(b) {
+  const u16be = i => (b[i] << 8) | b[i + 1], u32be = i => ((b[i] << 24) >>> 0) + (b[i + 1] << 16) + (b[i + 2] << 8) + b[i + 3];
+  const u16le = i => b[i] | (b[i + 1] << 8), i32le = i => b[i] | (b[i + 1] << 8) | (b[i + 2] << 16) | (b[i + 3] << 24);
+  if (b.length > 24 && b[0] === 0x89 && b[1] === 0x50 && b[2] === 0x4E && b[3] === 0x47) return [u32be(16), u32be(20)];
+  if (b.length > 10 && b[0] === 0x47 && b[1] === 0x49 && b[2] === 0x46) return [u16le(6), u16le(8)];
+  if (b.length > 26 && b[0] === 0x42 && b[1] === 0x4D) return [Math.abs(i32le(18)), Math.abs(i32le(22))];
+  if (b.length > 4 && b[0] === 0xFF && b[1] === 0xD8) {
+    let i = 2;
+    while (i + 9 < b.length) {
+      if (b[i] !== 0xFF) { i++; continue; }
+      const m = b[i + 1];
+      if (m >= 0xC0 && m <= 0xCF && m !== 0xC4 && m !== 0xC8 && m !== 0xCC) return [u16be(i + 7), u16be(i + 5)];
+      i += 2 + u16be(i + 2);
+    }
+  }
+  return null;
+}
+/**
+ * Raster image placed with its lower-left corner at `insert`.
+ * Give width and/or height in drawing units (the other follows the aspect
+ * ratio; neither = 1 unit per pixel).
+ */
+class Image extends Entity {
+  constructor(imageDef, insert = [0, 0, 0], { width = null, height = null, rotation = 0, ...common } = {}) {
+    super(common);
+    if (!(imageDef instanceof ImageDef)) throw new Error('Image needs an ImageDef');
+    const [wp, hp] = imageDef.size;
+    if (width === null && height === null) width = wp;
+    if (width === null) width = height * wp / hp;
+    if (height === null) height = width * hp / wp;
+    this.imageDef = imageDef; this.insert = insert; this.width = width; this.height = height;
+    this.rotation = rotation; this.flipped = false;
+  }
+  _pts() { return [this.insert]; }
+  _transformExtra(info) {
+    this.width *= info.s; this.height *= info.s;
+    if (info.mirror) this.flipped = !this.flipped;
+    this.rotation = _normAngle(info.angle(this.rotation));
+  }
+  _vectors() {
+    const [wp, hp] = this.imageDef.size;
+    const u = _rot([this.width / wp, 0], this.rotation);
+    const v = _mul(_rot([0, this.height / hp], this.rotation), this.flipped ? -1 : 1);
+    return [u, v];
+  }
+  _bbox() {
+    const [u, v] = this._vectors(), [wp, hp] = this.imageDef.size, p = this.insert;
+    const U = _mul(u, wp), V = _mul(v, hp);
+    return _bboxOf([p, _add(p, U), _add(p, V), _add(_add(p, U), V)]);
+  }
+  toString() {
+    if (!this.imageDef._handle) throw new Error('Image must be written through a Drawing');
+    const [u, v] = this._vectors(), [wp, hp] = this.imageDef.size;
+    const h = this._handle = _nextHandle();
+    return ['0','IMAGE',this._common(h),'100','AcDbRasterImage','90','0',_point(_xyz(this.insert)),
+            _point([_num(u[0]), _num(u[1]), 0], 1),_point([_num(v[0]), _num(v[1]), 0], 2),_point([wp, hp], 3),
+            '340',this.imageDef._handle,'70','3','280','0','281','50','282','50','283','0','360',this._reactor,
+            '71','1','91','2','14','-0.5','24','-0.5','14',wp - 0.5,'24',hp - 0.5,...this._xdata()].join(NL);
   }
 }
 
@@ -1666,6 +1812,7 @@ class Drawing extends Collection {
     const visit = e => {
       if (e instanceof Insert) { add(e.source); add(e.block); }
       if (e instanceof Leader || e instanceof MLeader) e._style = this._dimstyle(e.dimstyle);
+      if (e instanceof MLeader && e.block) add(e.block);
       if (e instanceof Dimension && !seen.has(e)) {
         seen.add(e);
         out.push(e._buildBlock(`*D${++dimCount}`, this._dimstyle(e.dimstyle)));
@@ -1698,6 +1845,11 @@ class Drawing extends Collection {
     // Optional objects / classes, only when something uses them
     const used = cls => [...this.entities, ...userBlocks.flatMap(b => b.entities)].some(e => e instanceof cls);
     const hasWipeout = used(Wipeout), hasMLeader = used(MLeader);
+    const images = [...this.entities, ...userBlocks.flatMap(b => b.entities)].filter(e => e instanceof Image);
+    const imageDefs = [...new Set(images.map(i => i.imageDef))];
+    const [H_IMGDICT, H_RASTERVARS] = images.length ? [_nextHandle(), _nextHandle()] : [null, null];
+    imageDefs.forEach(d => { d._handle = _nextHandle(); d._reactors = []; });
+    images.forEach(i => { i._reactor = _nextHandle(); i.imageDef._reactors.push(i); });
     const H_WOVARS = hasWipeout ? _nextHandle() : null;
     const [H_MLSDICT, H_MLS] = hasMLeader ? [_nextHandle(), _nextHandle()] : [null, null];
     _H_MLSTYLE = H_MLS;
@@ -1757,6 +1909,8 @@ class Drawing extends Collection {
     // ── CLASSES — custom objects used by this drawing ────────────
     const classDefs = [
       ...(hasWipeout ? [['WIPEOUTVARIABLES', 'AcDbWipeoutVariables', 'WipeOut', 0, 0], ['WIPEOUT', 'AcDbWipeout', 'WipeOut', 127, 1]] : []),
+      ...(images.length ? [['RASTERVARIABLES', 'AcDbRasterVariables', 'ISM', 0, 0], ['IMAGE', 'AcDbRasterImage', 'ISM', 2175, 1],
+                           ['IMAGEDEF', 'AcDbRasterImageDef', 'ISM', 0, 0], ['IMAGEDEF_REACTOR', 'AcDbRasterImageDefReactor', 'ISM', 1, 0]] : []),
       ...(hasMLeader ? [['MLEADERSTYLE', 'AcDbMLeaderStyle', 'ACDB_MLEADERSTYLE_CLASS', 4095, 0], ['MULTILEADER', 'AcDbMLeader', 'ACDB_MLEADER_CLASS', 3071, 1]] : []),
     ].map(([n, cpp, app, flags, isEnt]) => ['0','CLASS','1',n,'2',cpp,'3',app,'90',flags,'280','0','281',isEnt].join(NL));
     const classes = classDefs.length ? this._section('classes', classDefs) : null;
@@ -1787,6 +1941,7 @@ class Drawing extends Collection {
     const rootEntries = [['ACAD_GROUP', H_GROUPDICT]];
     if (hasMLeader) rootEntries.push(['ACAD_MLEADERSTYLE', H_MLSDICT]);
     if (hasWipeout) rootEntries.push(['ACAD_WIPEOUT_VARS', H_WOVARS]);
+    if (images.length) rootEntries.push(['ACAD_IMAGE_DICT', H_IMGDICT], ['ACAD_IMAGE_VARS', H_RASTERVARS]);
     const objectDefs = [
       ['0','DICTIONARY','5',H_ROOTDICT,'330','0','100','AcDbDictionary','281','1',
        ...rootEntries.flatMap(([k, h]) => ['3', k, '350', h])].join(NL),
@@ -1804,6 +1959,23 @@ class Drawing extends Collection {
        '294','1','141','0','177','0','142','1','295','0','296','0','143','3.75','271','0','272','9','273','9'].join(NL));
     if (hasWipeout) objectDefs.push(
       ['0','WIPEOUTVARIABLES',...owned(H_WOVARS, H_ROOTDICT),'100','AcDbWipeoutVariables','70',this.wipeoutFrame ? 1 : 0].join(NL));
+    if (images.length) {
+      const names = new Map();
+      for (const d of imageDefs) {   // dictionary key: file name without folder / extension
+        let n = d.filename.split(/[\\/]/).pop().replace(/\.[^.]*$/, '').toUpperCase() || 'IMAGE', k = n, i = 1;
+        while (names.has(k)) k = `${n}_${++i}`;
+        names.set(k, d);
+      }
+      const rasterUnits = { mm: 1, cm: 2, m: 3, km: 4, in: 5, ft: 6 }[String(this.units).toLowerCase()] || 0;
+      objectDefs.push(
+        ['0','DICTIONARY',...owned(H_IMGDICT, H_ROOTDICT),'100','AcDbDictionary','281','1',
+         ...[...names].flatMap(([k, d]) => ['3', k, '350', d._handle])].join(NL),
+        ['0','RASTERVARIABLES',...owned(H_RASTERVARS, H_ROOTDICT),'100','AcDbRasterVariables','90','0','70','0','71','1','72',rasterUnits].join(NL),
+        ...imageDefs.map(d => ['0','IMAGEDEF','5',d._handle,'102','{ACAD_REACTORS','330',H_IMGDICT,
+          ...d._reactors.flatMap(i => ['330', i._reactor]),'102','}','330',H_IMGDICT,'100','AcDbRasterImageDef','90','0',
+          '1',d.filename,'10',d.size[0],'20',d.size[1],'11','0.01','21','0.01','280','1','281','0'].join(NL)),
+        ...images.map(i => ['0','IMAGEDEF_REACTOR','5',i._reactor,'330',i._handle,'100','AcDbRasterImageDefReactor','90','2','330',i._handle].join(NL)));
+    }
     const objects = this._section('objects', objectDefs);
     _H_MLSTYLE = null;
 
@@ -1834,7 +2006,7 @@ if (typeof module !== 'undefined' && module.exports) {
     LinearParameter, FlipParameter, VisibilityParameter,
     Line, LwPolyLine, Circle, Arc, Ellipse, Spline, Point, Text, MText, Solid, Hatch, Leader,
     Dimension, LinearDimension, AlignedDimension, RadiusDimension, DiameterDimension, AngularDimension,
-    OrdinateDimension, XLine, Ray, Wipeout, MLeader, Table, Group,
+    OrdinateDimension, XLine, Ray, Wipeout, MLeader, Table, Group, Image, ImageDef,
     Collection, Entity, arrayRect, arrayPolar, calculate_end_point, HATCH_PATTERNS, LINETYPE_PRESETS,
   };
 }

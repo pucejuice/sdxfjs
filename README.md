@@ -68,7 +68,9 @@ Every entity accepts these options:
 | `MText(text, point, { height, width, attach, lineSpacing })` | `\n` starts a new line. |
 | `Hatch(boundary \| [outer, ...holes], { pattern, scale, angle })` | Patterns: `SOLID`, `ANSI31`, `ANSI32`, `ANSI37`, `NET`, `DOTS`, `EARTH`, or `{ name, lines }`. A boundary can be an `LwPolyLine`; its arcs are kept. |
 | `Leader(points, text, { dimstyle, height })` | Classic LEADER: arrow at the first point, MText at the last. |
-| `MLeader(points, text, { dimstyle, height, arrowSize, dogleg, gap })` | MULTILEADER: arrow tip … connection point, then a landing and the text on the side the leader points to. Sizes come from the dimstyle; a given `height` scales the rest with it. |
+| `MLeader(points, text \| { block, attributes }, { dimstyle, height, arrowSize, dogleg, gap, blockScale })` | MULTILEADER: arrow tip … connection point, then a landing and the content on the side the leader points to. Sizes come from the dimstyle; a given `height` scales the rest with it. Block content is centred at the end of the landing and scaled by the same factor, which suits grid bubbles and section markers. R2000 MULTILEADERs can't carry attribute values, so each set of values becomes a fixed block (`BUBBLE__REF-A`). |
+| `Image(imageDef, insert, { width, height, rotation })` | Linked raster image; the lower-left corner sits at `insert`. Give width or height and the other follows the aspect ratio. |
+| `ImageDef(filename, [wPx, hPx])`, `ImageDef.fromFile(path)`, `ImageDef.fromBytes(name, bytes)` | The image file reference. `fromFile` (Node) and `fromBytes` (browser) read the pixel size from PNG, JPEG, GIF or BMP headers. The file is linked, not embedded, so keep it next to the DXF or use a full path. |
 | `Table(topLeft, rows, { title, colWidths, rowHeights, textHeight, align, header, headerFill, format, rotation })` | Drawn with lines, MText and solid fills. Cells can be values or `{ text, align, colspan, rowspan, fill }`. Sizes left as `null` fit the text. |
 | `XLine(point, direction)`, `Ray(point, direction)` | Construction lines. |
 | `Wipeout(points)` | Masks what was drawn before it, so append it before the text on top. Drawing option `wipeoutFrame`. |
@@ -171,7 +173,8 @@ sdxf.js only **writes** R2000 drawings, and is aimed at 2D drafting automation.
 - Groups and XDATA.
 - Layers, linetypes, lineweights and true colour.
 - Linear, aligned, radius, diameter, angular and ordinate dimensions.
-- LEADER and MULTILEADER (MText content).
+- LEADER and MULTILEADER (MText or block content).
+- Linked raster images.
 - Tables, drawn from lines and text like ezdxf's table add-on.
 - Transforms and arrays.
 
@@ -181,8 +184,8 @@ sdxf.js only **writes** R2000 drawings, and is aimed at 2D drafting automation.
 
 | Feature | Effort |
 |---|---|
-| Paper-space layouts with viewports (drawing sheets), IMAGE references | M |
-| MULTILEADER with block content, R12 output | M |
+| Paper-space layouts with viewports (drawing sheets) | M |
+| R12 output | M |
 | AutoCAD's own TABLE entity (needs DXF 2004+; ezdxf can't create it either) | L |
 | 3D entities (3DFACE, MESH, polyface), ACIS solids | L |
 | Reading and editing existing DXF files, other DXF versions, binary DXF | Very large (essentially ezdxf's core) |
