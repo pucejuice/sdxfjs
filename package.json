@@ -1,0 +1,11 @@
+{
+  "name": "sdxf",
+  "version": "0.3.0",
+  "description": "Write AutoCAD R2000 DXF files from JavaScript: blocks, attributes, parametric blocks, hatches, dimensions",
+  "main": "sdxf.js",
+  "scripts": {
+    "test": "node tests/run.js",
+    "test:render": "node tests/run.js --render"
+  },
+  "license": "MIT"
+}

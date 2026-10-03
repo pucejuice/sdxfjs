@@ -27,6 +27,10 @@
  * Entity options: thickness, lineTypeScale, extrusion, trueColor ([r,g,b] or 0xRRGGBB).
  * MText, Hatch (SOLID + ANSI31/32/37, NET, DOTS, EARTH or custom),
  * LinearDimension / AlignedDimension with DimStyle (incl. dimscale for plot scale).
+ * Ellipse, Spline (control or fit points), Leader, Radius/Diameter/AngularDimension.
+ * Transforms on every entity: copy, translate, rotate, scale, mirror; arrayRect,
+ * arrayPolar; MINSERT grids. Dynamic blocks: flip, visibility, array, lookups.
+ * Full API: README.md. Tests: npm test.
  *
  * Blocks & attributes:
  *   AttDef  — attribute definition inside a Block (tag, prompt, default, flags)
@@ -84,6 +88,20 @@ function _bboxOf(pts) {
 function _union(boxes) {
   return _bboxOf(boxes.filter(Boolean).flat());
 }
+// 2D similarity transform m = [a, b, c, d, e, f]:  x' = a·x + c·y + e,  y' = b·x + d·y + f
+const _num = v => Number(v.toFixed(10));
+function _apply(m, p) {
+  const x = p[0], y = p[1];
+  p[0] = _num(m[0] * x + m[2] * y + m[4]); p[1] = _num(m[1] * x + m[3] * y + m[5]);
+}
+const _rot = ([x, y], deg) => {
+  const r = deg * Math.PI / 180, c = Math.cos(r), s = Math.sin(r);
+  return [x * c - y * s, x * s + y * c];
+};
+const _normAngle = a => _num(((a % 360) + 360) % 360);
+// Keep text readable after a mirror (like AutoCAD's MIRRTEXT = 0).
+const _readable = a => { a = _normAngle(a); return a > 90 && a <= 270 ? _normAngle(a - 180) : a; };
+const _textRotation = (info, r) => info.mirror ? _readable(info.angle(r || 0)) : _normAngle(info.angle(r || 0));
 function _rgb(c) { return Array.isArray(c) ? (c[0] << 16) + (c[1] << 8) + c[2] : c; }
 function calculate_end_point(start_point, angle_degrees, length) {
   const [x_start, y_start] = start_point;
@@ -124,8 +142,70 @@ class Entity {
     }
     return lines;
   }
-  // Mutable references to every defining point — used by dynamic block actions.
+  // Mutable references to every defining point — used by dynamic block actions and transforms.
   _pts() { return []; }
+
+  // ── Transforms (in place, chainable). Use copy() first to keep the original. ──
+  copy() { return _cloneEntity(this); }
+  /** Apply m = [a,b,c,d,e,f]; only moves, rotations, uniform scaling and mirroring. */
+  transform(m) {
+    const s = Math.hypot(m[0], m[1]), det = m[0] * m[3] - m[1] * m[2];
+    if (!s || Math.abs(Math.hypot(m[2], m[3]) - s) > 1e-9 * s || Math.abs(m[0] * m[2] + m[1] * m[3]) > 1e-9 * s * s)
+      throw new Error('transform: only moves, rotations, uniform scaling and mirroring are supported');
+    const beta = Math.atan2(m[1], m[0]) * 180 / Math.PI, mirror = det < 0;
+    const info = { m, s, mirror, beta, angle: th => mirror ? beta - th : th + beta };
+    // Detach point arrays the caller may share with other entities before mutating them.
+    for (const [k, v] of Object.entries(this)) if (Array.isArray(v)) this[k] = _deep(v);
+    for (const p of new Set(this._pts())) _apply(m, p);
+    this._transformExtra(info);
+    return this;
+  }
+  _transformExtra(info) {}   // angles, radii, heights… per entity type
+  translate(dx, dy = 0) { return this.transform([1, 0, 0, 1, dx, dy]); }
+  rotate(angle, center = [0, 0]) {
+    const r = angle * Math.PI / 180, c = Math.cos(r), s = Math.sin(r), [x, y] = center;
+    return this.transform([c, s, -s, c, x - c * x + s * y, y - s * x - c * y]);
+  }
+  scale(factor, center = [0, 0]) {
+    const [x, y] = center;
+    return this.transform([factor, 0, 0, factor, x - factor * x, y - factor * y]);
+  }
+  /** Mirror about the line through p1 and p2. */
+  mirror(p1, p2) {
+    const a = 2 * Math.atan2(p2[1] - p1[1], p2[0] - p1[0]), c = Math.cos(a), s = Math.sin(a);
+    return this.transform([c, s, s, -c, p1[0] - c * p1[0] - s * p1[1], p1[1] - s * p1[0] + c * p1[1]]);
+  }
+}
+
+/** Copies of `entities` in a grid (the first cell is a copy too, at the original position). */
+function arrayRect(entities, { rows = 1, cols = 1, rowSpacing = 0, colSpacing = 0 } = {}) {
+  const out = [];
+  for (let r = 0; r < rows; r++)
+    for (let c = 0; c < cols; c++)
+      for (const e of entities) out.push(e.copy().translate(c * colSpacing, r * rowSpacing));
+  return out;
+}
+/**
+ * Copies of `entities` around `center`. angle = total sweep (360 = full circle,
+ * items evenly spaced; otherwise first and last item at 0 and `angle`).
+ * rotateItems: false keeps each copy's orientation and only moves it.
+ */
+function arrayPolar(entities, { count, center = [0, 0], angle = 360, rotateItems = true } = {}) {
+  const step = Math.abs(angle) >= 360 ? angle / count : angle / Math.max(1, count - 1);
+  const box = _union(entities.map(e => e._bbox())) || [center, center];
+  const ref = [(box[0][0] + box[1][0]) / 2, (box[0][1] + box[1][1]) / 2];
+  const out = [];
+  for (let i = 0; i < count; i++)
+    for (const e of entities) {
+      if (rotateItems) { out.push(e.copy().rotate(i * step, center)); continue; }
+      const p = [...ref]; _apply(_rotM(i * step, center), p);
+      out.push(e.copy().translate(p[0] - ref[0], p[1] - ref[1]));
+    }
+  return out;
+}
+function _rotM(angle, [x, y]) {
+  const r = angle * Math.PI / 180, c = Math.cos(r), s = Math.sin(r);
+  return [c, s, -s, c, x - c * x + s * y, y - s * x - c * y];
 }
 
 // Text alignment names (same as ezdxf's TextEntityAlignment) → [72 halign, valign]
@@ -269,6 +349,7 @@ class AttDef extends Entity {
   }
   get constant() { return (this.flags & 2) !== 0; }
   _pts() { return this.alignPoint ? [this.point, this.alignPoint] : [this.point]; }
+  _transformExtra(info) { this.height *= info.s; this.rotation = _textRotation(info, this.rotation); }
   toString() {
     const [text, valign] = _textLines(this, this.defaultValue);
     const lines = ['0','ATTDEF',this._common(),...text,
@@ -298,19 +379,23 @@ class Attrib extends Entity {
  * Block reference.
  *   new Insert(block, [x,y,0], { rotation, xscale, yscale, zscale,
  *                                attributes: { TAG: 'value' },     // fills AttDefs
- *                                params: { LENGTH: 1500 } })       // DynamicBlock only
+ *                                params: { LENGTH: 1500 },         // DynamicBlock only
+ *                                rows, cols, rowSpacing, colSpacing })  // MINSERT grid
  * `block` may be a Block / DynamicBlock object or a block name string
  * (attributes and params need the object).
  */
 class Insert extends Entity {
   constructor(block, insert = [0,0,0], { xscale = 1, yscale = 1, zscale = 1, rotation = 0,
-                                        attributes = {}, params = null, ...common } = {}) {
+                                        attributes = {}, params = null,
+                                        rows = 1, cols = 1, rowSpacing = 0, colSpacing = 0, ...common } = {}) {
     super(common);
     this.insert = insert; this.xscale = xscale; this.yscale = yscale; this.zscale = zscale; this.rotation = rotation;
+    this.rows = rows; this.cols = cols; this.rowSpacing = rowSpacing; this.colSpacing = colSpacing;
     this.attributes = Object.fromEntries(Object.entries(attributes || {}).map(([k, v]) => [_tag(k), v]));
     this.params = null;
     if (block instanceof DynamicBlock) {
       this.params = block.resolveParams(params || {});
+      this.choices = block.lookupChoices(params || {});
       this.source = block;
       this.block = block.variant(this.params);
     } else {
@@ -325,14 +410,30 @@ class Insert extends Entity {
       if (bad.length) throw new Error(`Block '${this.block.name}' has no attribute(s) ${bad.join(', ')}. Valid: ${[...tags].join(', ') || '(none)'}`);
     }
   }
+  get isGrid() { return this.rows > 1 || this.cols > 1; }
   _bbox() {
     const b = this.block instanceof Block ? this.block._bbox() : null;
     if (!b) return _bboxOf([this.insert]);
     const [[x0, y0], [x1, y1]] = b;
-    return _bboxOf([[x0, y0], [x1, y0], [x1, y1], [x0, y1]].map(p => this._transform(p)));
+    const one = [[x0, y0], [x1, y0], [x1, y1], [x0, y1]].map(p => this._transform(p));
+    if (!this.isGrid) return _bboxOf(one);
+    // MINSERT: the grid runs along the insert's rotated x / y axes
+    const corners = [];
+    for (const [c, r] of [[0, 0], [this.cols - 1, 0], [0, this.rows - 1], [this.cols - 1, this.rows - 1]]) {
+      const [dx, dy] = _rot([c * this.colSpacing, r * this.rowSpacing], this.rotation);
+      corners.push(...one.map(p => [p[0] + dx, p[1] + dy]));
+    }
+    return _bboxOf(corners);
+  }
+  _pts() { return [this.insert]; }
+  _transformExtra(info) {
+    if (info.mirror) { this.rotation = info.beta - this.rotation; this.yscale = -this.yscale; this.rowSpacing = -this.rowSpacing; }
+    else this.rotation += info.beta;
+    this.rotation = _normAngle(this.rotation);
+    this.xscale *= info.s; this.yscale *= info.s; this.zscale *= info.s;
+    this.rowSpacing *= info.s; this.colSpacing *= info.s;
   }
   get blockName() { return (typeof this.block === 'string' ? this.block : this.block.name).toUpperCase(); }
-  _pts() { return [this.insert]; }
   // Block coords → world coords for this insert
   _transform(p) {
     const base = this.block.base, r = this.rotation * Math.PI / 180;
@@ -355,11 +456,18 @@ class Insert extends Entity {
         color: a.color,
       }));
   }
+  // XDATA SDXF_DYNBLOCK: source block name, then name/value pairs
+  // (1040 number, 1070 0/1 flip, 1000 text), then lookup choices.
   _dynXdata() {
     if (!this.params) return [];
-    const pairs = [[1000, this.source.name.toUpperCase()]];
-    for (const [k, v] of Object.entries(this.params)) pairs.push([1000, k], [1040, v]);
-    return ['1001', DYN_APPID, ...pairs.flatMap(([c, v]) => [String(c), v])];
+    const lines = ['1001', DYN_APPID, '1000', this.source.name.toUpperCase()];
+    for (const [k, v] of Object.entries({ ...this.params, ...this.choices })) {
+      lines.push('1000', k);
+      if (typeof v === 'number') lines.push('1040', v);
+      else if (typeof v === 'boolean') lines.push('1070', v ? 1 : 0);
+      else lines.push('1000', v);
+    }
+    return lines;
   }
   toString() {
     const h = _nextHandle();
@@ -371,7 +479,8 @@ class Insert extends Entity {
     if (this.yscale !== 1) lines.push('42', this.yscale);
     if (this.zscale !== 1) lines.push('43', this.zscale);
     if (this.rotation) lines.push('50', this.rotation);
-    lines.push(...this._dynXdata(), ...this._xdata());
+    if (this.isGrid) lines.push('70', this.cols, '71', this.rows, '44', this.colSpacing, '45', this.rowSpacing);
+    lines.push(...this._extr(), ...this._dynXdata(), ...this._xdata());
     if (attribs.length) {
       for (const a of attribs) lines.push(a._toString(h));
       lines.push('0','SEQEND','5',_nextHandle(),'330',h,'100','AcDbEntity','8',(this.parent || this).layer);
@@ -382,6 +491,9 @@ class Insert extends Entity {
 
 // ── Dynamic blocks ────────────────────────────────────────────────────────────
 const _fmt = v => String(Number(Number(v).toFixed(6)));
+// Value → block-name-safe text
+const _key = v => typeof v === 'number' ? _fmt(v) : typeof v === 'boolean' ? (v ? 'Y' : 'N')
+                : String(v).toUpperCase().replace(/[^A-Z0-9.]+/g, '_');
 
 /** Linear parameter: distance from `base` to `end`; its default value is that distance. */
 class LinearParameter {
@@ -396,6 +508,7 @@ class LinearParameter {
     this.values = values ? [...values].sort((a, b) => a - b) : null;
     this.baseLocation = baseLocation;
   }
+  get default() { return this.resolve(this.distance); }
   /** Snap a requested value to the value set, like AutoCAD does when you drag a grip. */
   resolve(v) {
     v = Number(v);
@@ -414,6 +527,38 @@ class LinearParameter {
   _gripShift(grip, delta) {
     if (this.baseLocation === 'midpoint') return grip === 'end' ? delta / 2 : -delta / 2;
     return grip === 'end' ? delta : 0;  // base at start: only the end point moves
+  }
+}
+/** Flip parameter: true mirrors the flip action's entities about the line base → end. */
+class FlipParameter {
+  constructor(name, base, end) {
+    this.name = _tag(name); this.base = base; this.end = end;
+    if (base[0] === end[0] && base[1] === end[1]) throw new Error(`Flip parameter '${name}': base and end points coincide`);
+  }
+  get default() { return false; }
+  resolve(v) {
+    if (typeof v === 'string') return ['1', 'TRUE', 'YES', 'Y', 'FLIPPED'].includes(v.trim().toUpperCase());
+    return !!v;
+  }
+}
+/** Visibility parameter: named states, each showing a subset of the block's entities. */
+class VisibilityParameter {
+  constructor(name, states, defaultState = null) {
+    this.name = _tag(name);
+    this.states = new Map(Object.entries(states).map(([k, v]) => [String(k).trim().toUpperCase(), v]));
+    if (!this.states.size) throw new Error('Visibility parameter needs at least one state');
+    this._default = defaultState === null ? [...this.states.keys()][0] : this.resolve(defaultState);
+  }
+  get default() { return this._default; }
+  resolve(v) {
+    const k = String(v).trim().toUpperCase();
+    if (!this.states.has(k)) throw new Error(`Visibility '${this.name}': no state '${v}'. States: ${[...this.states.keys()].join(', ')}`);
+    return k;
+  }
+  /** Entities hidden in `state`: those listed in some state but not in this one. */
+  hidden(state) {
+    const shown = new Set(this.states.get(state));
+    return new Set([...this.states.values()].flat().filter(e => !shown.has(e)));
   }
 }
 
@@ -442,63 +587,140 @@ function _cloneEntity(e) {
  *   beam.addLinearParameter('length', [0,0], [1000,0], { min: 500, max: 6000, increment: 50 });
  *   beam.addStretchAction('length', { frame: [[900,-50],[1100,250]] });
  *   drawing.append(new Insert(beam, [0,0], { params: { length: 2350 } }));
+ *
+ * Parameters: linear (stretch / move / array actions), flip (flip action),
+ * visibility states, and lookup tables that set several parameters by one key.
  */
 class DynamicBlock extends Block {
   constructor(name, options = {}) {
     super(name, options);
-    this.parameters = {}; this.actions = []; this._variants = new Map();
+    this.parameters = {}; this.actions = []; this.lookups = {}; this._variants = new Map();
   }
-  addLinearParameter(name, base, end, options = {}) {
-    const p = new LinearParameter(name, base, end, options);
+  _addParam(p) {
+    if (this.parameters[p.name] || this.lookups[p.name]) throw new Error(`DynamicBlock '${this.name}': '${p.name}' is already defined`);
     this.parameters[p.name] = p;
     return p;
   }
-  _action(type, param, { entities = null, grip = 'end', multiplier = 1, angleOffset = 0, frame = null }) {
+  addLinearParameter(name, base, end, options = {}) { return this._addParam(new LinearParameter(name, base, end, options)); }
+  addFlipParameter(name, base, end) { return this._addParam(new FlipParameter(name, base, end)); }
+  /** states: { STATE: [entities shown] }. Entities in no state are always shown. */
+  addVisibilityStates(states, { name = 'visibility', defaultState = null } = {}) {
+    for (const e of Object.values(states).flat())
+      if (!this.entities.includes(e)) throw new Error(`Visibility entity is not part of block '${this.name}'`);
+    return this._addParam(new VisibilityParameter(name, states, defaultState));
+  }
+  /**
+   * Lookup table: one key sets several parameters, e.g. steel sections
+   *   addLookup('section', { UB203: { depth: 203, width: 133 }, UB254: { depth: 254, width: 146 } })
+   *   new Insert(blk, pt, { params: { section: 'UB254' } })
+   */
+  addLookup(name, table) {
+    const n = _tag(name);
+    if (this.parameters[n] || this.lookups[n]) throw new Error(`DynamicBlock '${this.name}': '${n}' is already defined`);
+    const rows = new Map();
+    for (const [key, row] of Object.entries(table)) {
+      const r = Object.fromEntries(Object.entries(row).map(([k, v]) => [_tag(k), v]));
+      for (const k of Object.keys(r)) if (!this.parameters[k]) throw new Error(`Lookup '${n}': no parameter '${k}' (add parameters before the lookup)`);
+      rows.set(String(key).trim().toUpperCase(), { key, row: r });
+    }
+    this.lookups[n] = rows;
+    return this;
+  }
+  _param(param, cls, action) {
     const p = this.parameters[_tag(param)];
     if (!p) throw new Error(`DynamicBlock '${this.name}': no parameter '${param}'`);
+    if (!(p instanceof cls)) throw new Error(`${action} action needs a ${cls.name}, '${p.name}' is a ${p.constructor.name}`);
+    return p;
+  }
+  _action(type, p, { entities = null, grip = 'end', multiplier = 1, angleOffset = 0, frame = null, spacing = null, inclusive = false }) {
     if (!['start', 'end'].includes(grip)) throw new Error(`grip must be 'start' or 'end'`);
     const sel = entities || this.entities;
     for (const e of sel) if (!this.entities.includes(e)) throw new Error(`Action entity is not part of block '${this.name}'`);
-    this.actions.push({ type, param: p, entities: sel, grip, multiplier, angleOffset, frame });
+    this.actions.push({ type, param: p, entities: sel, grip, multiplier, angleOffset, frame, spacing, inclusive });
     return this;
   }
   /** Points of the selected entities that lie inside `frame` move; everything else stays. */
   addStretchAction(param, { frame, ...options }) {
     if (!frame || frame.length < 2) throw new Error('Stretch action needs a frame: [[x1,y1],[x2,y2]] or a polygon');
-    return this._action('stretch', param, { ...options, frame });
+    return this._action('stretch', this._param(param, LinearParameter, 'Stretch'), { ...options, frame });
   }
   /** The selected entities move as a whole with the grip. */
   addMoveAction(param, { entities, ...options }) {
     if (!entities || !entities.length) throw new Error('Move action needs an entities list');
-    return this._action('move', param, { ...options, entities });
+    return this._action('move', this._param(param, LinearParameter, 'Move'), { ...options, entities });
   }
-  /** Fill in defaults and snap every value to its parameter's value set. */
-  resolveParams(params) {
-    const out = {};
+  /**
+   * Repeat the entities every `spacing` along the parameter, like AutoCAD's array
+   * action: count = floor(value / spacing) (at least 1). inclusive: true adds one
+   * more, for items that sit on both ends of the parameter (studs at 0 … L).
+   */
+  addArrayAction(param, { entities, spacing, ...options }) {
+    if (!entities || !entities.length) throw new Error('Array action needs an entities list');
+    if (!(spacing > 0)) throw new Error('Array action needs spacing > 0');
+    return this._action('array', this._param(param, LinearParameter, 'Array'), { ...options, entities, spacing });
+  }
+  /** Mirror the entities about the flip parameter's line when it is true. */
+  addFlipAction(param, { entities = null } = {}) {
+    return this._action('flip', this._param(param, FlipParameter, 'Flip'), { entities });
+  }
+  _given(params) {
     const given = Object.fromEntries(Object.entries(params).map(([k, v]) => [_tag(k), v]));
     for (const k of Object.keys(given))
-      if (!this.parameters[k]) throw new Error(`DynamicBlock '${this.name}' has no parameter '${k}'. Valid: ${Object.keys(this.parameters).join(', ')}`);
-    for (const [k, p] of Object.entries(this.parameters)) out[k] = k in given ? p.resolve(given[k]) : p.resolve(p.distance);
+      if (!this.parameters[k] && !this.lookups[k])
+        throw new Error(`DynamicBlock '${this.name}' has no parameter '${k}'. Valid: ${[...Object.keys(this.parameters), ...Object.keys(this.lookups)].join(', ')}`);
+    return given;
+  }
+  /** Lookup keys chosen in `params`, e.g. { SECTION: 'UB254' }. */
+  lookupChoices(params) {
+    const out = {};
+    for (const [k, v] of Object.entries(this._given(params)))
+      if (this.lookups[k]) out[k] = this._lookupRow(k, v).key;
     return out;
   }
-  /** Concrete Block for a set of parameter values (cached; the base block for defaults). */
+  _lookupRow(name, v) {
+    const r = this.lookups[name].get(String(v).trim().toUpperCase());
+    if (!r) throw new Error(`Lookup '${name}': no entry '${v}'. Entries: ${[...this.lookups[name].values()].map(x => x.key).join(', ')}`);
+    return r;
+  }
+  /** Expand lookups, fill in defaults and snap every value to its parameter's value set. */
+  resolveParams(params) {
+    const given = this._given(params), vals = {};
+    for (const [k, v] of Object.entries(given)) if (this.parameters[k]) vals[k] = v;
+    for (const [k, v] of Object.entries(given)) {
+      if (!this.lookups[k]) continue;
+      for (const [p, pv] of Object.entries(this._lookupRow(k, v).row)) {
+        if (p in vals && this.parameters[p].resolve(vals[p]) !== this.parameters[p].resolve(pv))
+          throw new Error(`Parameter ${p}: ${vals[p]} conflicts with lookup ${k}=${v} (${pv})`);
+        vals[p] = pv;
+      }
+    }
+    const out = {};
+    for (const [k, p] of Object.entries(this.parameters)) out[k] = k in vals ? p.resolve(vals[k]) : p.default;
+    return out;
+  }
+  /** Concrete Block for a set of parameter values (cached; the base block when nothing changes). */
   variant(params = {}) {
     const values = this.resolveParams(params);
-    const changed = Object.entries(values).filter(([k, v]) => Math.abs(v - this.parameters[k].distance) > 1e-9);
-    if (!changed.length) return this;
-    const name = this.name.toUpperCase() + Object.entries(values).map(([k, v]) => `__${k}-${_fmt(v)}`).join('');
+    const changed = Object.entries(values).some(([k, v]) => {
+      const p = this.parameters[k];
+      return p instanceof LinearParameter ? Math.abs(v - p.distance) > 1e-9 : v !== p.default;
+    });
+    const always = this.actions.some(a => a.type === 'array') ||
+                   Object.values(this.parameters).some(p => p instanceof VisibilityParameter);
+    if (!changed && !always) return this;
+    const name = this.name.toUpperCase() + Object.entries(values).map(([k, v]) => `__${k}-${_key(v)}`).join('');
     if (this._variants.has(name)) return this._variants.get(name);
 
     const clones = new Map(this.entities.map(e => [e, _cloneEntity(e)]));
-    // Test frames against the ORIGINAL geometry and sum the shifts, so actions
-    // from different parameters (e.g. length + width) are independent of order.
+    // 1. Stretch / move. Frames are tested against the ORIGINAL geometry and the
+    //    shifts summed, so actions of different parameters are order-independent.
     const shifts = new Map();  // point array → [dx, dy]
     for (const a of this.actions) {
+      if (a.type !== 'stretch' && a.type !== 'move') continue;
       const p = a.param;
       const s = p._gripShift(a.grip, values[p.name] - p.distance) * a.multiplier;
       if (!s) continue;
-      const ang = (p.angle + a.angleOffset) * Math.PI / 180;
-      const dx = Number((s * Math.cos(ang)).toFixed(9)), dy = Number((s * Math.sin(ang)).toFixed(9));
+      const [dx, dy] = _rot([s, 0], p.angle + a.angleOffset).map(_num);
       for (const e of a.entities) {
         const orig = e._pts(), copy = clones.get(e)._pts();
         orig.forEach((pt, i) => {
@@ -508,9 +730,33 @@ class DynamicBlock extends Block {
         });
       }
     }
-    for (const [pt, [dx, dy]] of shifts) { pt[0] += dx; pt[1] += dy; }
+    for (const [pt, [dx, dy]] of shifts) { pt[0] = _num(pt[0] + dx); pt[1] = _num(pt[1] + dy); }
+    // 2. Arrays: extra copies of the (stretched) clones
+    const extra = new Map();   // original entity → [copies]
+    for (const a of this.actions) {
+      if (a.type !== 'array') continue;
+      const v = values[a.param.name];
+      const n = Math.max(1, Math.floor(v / a.spacing + 1e-9) + (a.inclusive ? 1 : 0));
+      const [ux, uy] = _rot([a.spacing, 0], a.param.angle + a.angleOffset);
+      for (const e of a.entities)
+        for (let k = 1; k < n; k++) {
+          const list = extra.get(e) || [];
+          list.push(clones.get(e).copy().translate(ux * k, uy * k));
+          extra.set(e, list);
+        }
+    }
+    // 3. Flips
+    for (const a of this.actions) {
+      if (a.type !== 'flip' || !values[a.param.name]) continue;
+      for (const e of a.entities) for (const c of [clones.get(e), ...(extra.get(e) || [])]) c.mirror(a.param.base, a.param.end);
+    }
+    // 4. Visibility
+    const hidden = new Set();
+    for (const p of Object.values(this.parameters))
+      if (p instanceof VisibilityParameter) p.hidden(values[p.name]).forEach(e => hidden.add(e));
+    const entities = this.entities.filter(e => !hidden.has(e)).flatMap(e => [clones.get(e), ...(extra.get(e) || [])]);
 
-    const blk = new Block(name, { layer: this.layer, flag: this.flag, base: this.base, entities: [...clones.values()] });
+    const blk = new Block(name, { layer: this.layer, flag: this.flag, base: this.base, entities });
     blk.paramValues = values; blk.source = this;
     this._variants.set(name, blk);
     return blk;
@@ -530,6 +776,13 @@ class LwPolyLine extends Entity {
     this.elevation = elevation; this.bulge = bulge; this.bulges = bulges;
   }
   _pts() { return this.points; }
+  _transformExtra(info) {
+    if (info.mirror) {
+      if (this.bulge !== null) this.bulge = -this.bulge;
+      if (this.bulges) this.bulges = this.bulges.map(b => -b);
+    }
+    if (this.width !== null) this.width *= info.s;
+  }
   toString() {
     if (!this.points || this.points.length < 2) return '';
     const lines = ['0','LWPOLYLINE',this._common(),'100','AcDbPolyline',
@@ -550,6 +803,7 @@ class Circle extends Entity {
   constructor(center = [0,0,0], radius = 1, commonOptions = {}) { super(commonOptions); this.center = center; this.radius = radius; }
   _pts() { return [this.center]; }
   _bbox() { const [x, y] = this.center, r = this.radius; return [[x - r, y - r], [x + r, y + r]]; }
+  _transformExtra(info) { this.radius *= info.s; }
   toString() { return ['0','CIRCLE',this._common(),'100','AcDbCircle',...this._thick(),_point(this.center),'40',this.radius,...this._extr(),...this._xdata()].join(NL); }
 }
 class Arc extends Entity {
@@ -558,6 +812,11 @@ class Arc extends Entity {
   }
   _pts() { return [this.center]; }
   _bbox() { const [x, y] = this.center, r = this.radius; return [[x - r, y - r], [x + r, y + r]]; }
+  _transformExtra(info) {
+    this.radius *= info.s;
+    const [s, e] = [info.angle(this.startAngle), info.angle(this.endAngle)];
+    [this.startAngle, this.endAngle] = (info.mirror ? [e, s] : [s, e]).map(_normAngle);  // mirror reverses direction
+  }
   toString() { return ['0','ARC',this._common(),'100','AcDbCircle',...this._thick(),_point(this.center),'40',this.radius,...this._extr(),'100','AcDbArc','50',this.startAngle,'51',this.endAngle,...this._xdata()].join(NL); }
 }
 class Point extends Entity {
@@ -571,6 +830,7 @@ class Text extends Entity {
     this.align = align; this.alignPoint = alignPoint;
   }
   _pts() { return this.alignPoint ? [this.point, this.alignPoint] : [this.point]; }
+  _transformExtra(info) { this.height *= info.s; this.rotation = _textRotation(info, this.rotation); }
   _bbox() {
     const [h, v] = _alignCodes(this.align);
     return _textBox(this.alignPoint || this.point, String(this.text ?? '').trim().length * this.height * 0.8,
@@ -611,6 +871,10 @@ class MText extends Entity {
     this.attach = attach; this.rotation = rotation; this.style = style; this.lineSpacing = lineSpacing;
   }
   _pts() { return [this.point]; }
+  _transformExtra(info) {
+    this.height *= info.s; if (this.width !== null) this.width *= info.s;
+    this.rotation = _textRotation(info, this.rotation);
+  }
   _bbox() {
     const rows = String(this.text).split('\n');
     const w = this.width || Math.max(...rows.map(r => r.length)) * this.height * 0.8;
@@ -649,11 +913,6 @@ const HATCH_PATTERNS = {
            [0, 0, 4.7625, 6.35, 6.35, 6.35, -6.35], [90, 0.79375, 5.55625, 6.35, 6.35, 6.35, -6.35],
            [90, 3.175, 5.55625, 6.35, 6.35, 6.35, -6.35], [90, 5.55625, 5.55625, 6.35, 6.35, 6.35, -6.35]],
 };
-const _rot = ([x, y], deg) => {
-  const r = deg * Math.PI / 180, c = Math.cos(r), s = Math.sin(r);
-  return [x * c - y * s, x * s + y * c];
-};
-const _num = v => Number(v.toFixed(10));
 /**
  * Hatch inside one or more closed boundaries (the first is the outer, the rest are holes).
  *   new Hatch([[0,0],[100,0],[100,50],[0,50]], { pattern: 'ANSI31', scale: 2 })
@@ -683,6 +942,10 @@ class Hatch extends Entity {
   }
   get solid() { return this.pattern.name === 'SOLID'; }
   _pts() { return this.paths.flatMap(([pts]) => pts); }
+  _transformExtra(info) {
+    if (info.mirror) this.paths = this.paths.map(([p, b]) => [p, b && b.map(x => -x)]);
+    this.angle = _normAngle(info.angle(this.angle)); this.scale *= info.s;
+  }
   toString() {
     const lines = ['0','HATCH',this._common(),'100','AcDbHatch','10','0','20','0','30','0',
                    ...(this.extrusion ? this._extr() : ['210','0','220','0','230','1']),
@@ -709,6 +972,114 @@ class Hatch extends Entity {
   }
 }
 
+// ── Ellipse / Spline ──────────────────────────────────────────────────────────
+/**
+ * Ellipse: majorAxis is the vector from the centre to the end of the major axis,
+ * ratio = minor/major. start/end are parameters in radians (0..2π = full ellipse).
+ */
+class Ellipse extends Entity {
+  constructor(center = [0,0,0], majorAxis = [1,0,0], ratio = 1, { start = 0, end = 2 * Math.PI, ...common } = {}) {
+    super(common);
+    if (!(ratio > 0)) throw new Error('Ellipse ratio must be > 0');
+    if (ratio > 1) {   // DXF requires ratio <= 1: swap the axes
+      majorAxis = _rot(majorAxis, 90).map(v => v * ratio); ratio = 1 / ratio;
+      start -= Math.PI / 2; end -= Math.PI / 2;
+    }
+    this.center = center; this.majorAxis = [majorAxis[0], majorAxis[1]]; this.ratio = ratio;
+    this.start = start; this.end = end;
+  }
+  _pts() { return [this.center]; }
+  _bbox() {
+    const [ax, ay] = this.majorAxis, bx = -ay * this.ratio, by = ax * this.ratio;
+    const hx = Math.hypot(ax, bx), hy = Math.hypot(ay, by), [x, y] = this.center;
+    return [[x - hx, y - hy], [x + hx, y + hy]];
+  }
+  _transformExtra(info) {
+    const [a, b, c, d] = info.m, [x, y] = this.majorAxis;
+    this.majorAxis = [_num(a * x + c * y), _num(b * x + d * y)];
+    if (info.mirror) [this.start, this.end] = [2 * Math.PI - this.end, 2 * Math.PI - this.start];
+  }
+  toString() {
+    return ['0','ELLIPSE',this._common(),'100','AcDbEllipse',_point(_xyz(this.center)),_point([...this.majorAxis, 0], 1),
+            ...this._extr(),'40',this.ratio,'41',this.start,'42',this.end,...this._xdata()].join(NL);
+  }
+}
+
+/**
+ * B-spline through control points (clamped, so it starts and ends on the first
+ * and last point). Spline.fromFitPoints(points) makes one that passes through
+ * every point.
+ */
+class Spline extends Entity {
+  constructor(controlPoints, { degree = 3, knots = null, ...common } = {}) {
+    super(common);
+    this.controlPoints = controlPoints.map(p => [p[0], p[1]]);
+    const n = this.controlPoints.length;
+    if (n < 2) throw new Error('Spline needs at least 2 control points');
+    this.degree = Math.min(degree, n - 1);
+    this.knots = knots || _clampedKnots(n, this.degree);
+    if (this.knots.length !== n + this.degree + 1) throw new Error(`Spline: expected ${n + this.degree + 1} knots, got ${this.knots.length}`);
+  }
+  /** Global interpolation (The NURBS Book, A9.1) with chord-length parameters. */
+  static fromFitPoints(points, { degree = 3, ...options } = {}) {
+    const Q = points.map(p => [p[0], p[1]]), n = Q.length;
+    if (n < 2) throw new Error('Spline needs at least 2 fit points');
+    const p = Math.min(degree, n - 1);
+    const d = Q.slice(1).map((q, i) => Math.hypot(q[0] - Q[i][0], q[1] - Q[i][1]));
+    const total = d.reduce((a, b) => a + b, 0);
+    if (!total) throw new Error('Spline fit points are all the same point');
+    const u = [0]; d.forEach(di => u.push(u[u.length - 1] + di / total)); u[n - 1] = 1;
+    const U = [...Array(p + 1).fill(0)];
+    for (let j = 1; j < n - p; j++) U.push(u.slice(j, j + p).reduce((a, b) => a + b, 0) / p);
+    U.push(...Array(p + 1).fill(1));
+    const A = u.map(uk => Array.from({ length: n }, (_, i) => _basis(i, p, uk, U)));
+    const P = _solve(A, Q);
+    return new Spline(P, { degree: p, knots: U, ...options });
+  }
+  _pts() { return this.controlPoints; }
+  toString() {
+    const lines = ['0','SPLINE',this._common(),'100','AcDbSpline',
+                   ...(this.extrusion ? this._extr() : ['210','0','220','0','230','1']),
+                   '70','8','71',this.degree,'72',this.knots.length,'73',this.controlPoints.length,'74','0',
+                   '42','0.0000000001','43','0.0000000001'];
+    this.knots.forEach(k => lines.push('40', _num(k)));
+    this.controlPoints.forEach(c => lines.push(_point([c[0], c[1], 0])));
+    return [...lines, ...this._xdata()].join(NL);
+  }
+}
+function _clampedKnots(n, p) {
+  const inner = Array.from({ length: n - p - 1 }, (_, i) => i + 1);
+  return [...Array(p + 1).fill(0), ...inner, ...Array(p + 1).fill(n - p)];
+}
+// Cox–de Boor basis function N(i,p) at u
+function _basis(i, p, u, U) {
+  if (p === 0) {
+    // u at the very end belongs to the last non-empty span
+    if (u === U[U.length - 1]) return U[i] < U[i + 1] && U[i + 1] === u ? 1 : 0;
+    return U[i] <= u && u < U[i + 1] ? 1 : 0;
+  }
+  let a = 0, b = 0;
+  if (U[i + p] !== U[i]) a = (u - U[i]) / (U[i + p] - U[i]) * _basis(i, p - 1, u, U);
+  if (U[i + p + 1] !== U[i + 1]) b = (U[i + p + 1] - u) / (U[i + p + 1] - U[i + 1]) * _basis(i + 1, p - 1, u, U);
+  return a + b;
+}
+// Solve A·X = B (B has 2 columns) by Gaussian elimination with partial pivoting
+function _solve(A, B) {
+  const n = A.length, M = A.map((r, i) => [...r, ...B[i]]);
+  for (let c = 0; c < n; c++) {
+    let piv = c;
+    for (let r = c + 1; r < n; r++) if (Math.abs(M[r][c]) > Math.abs(M[piv][c])) piv = r;
+    [M[c], M[piv]] = [M[piv], M[c]];
+    if (Math.abs(M[c][c]) < 1e-14) throw new Error('Spline interpolation failed (repeated fit points?)');
+    for (let r = 0; r < n; r++) {
+      if (r === c) continue;
+      const f = M[r][c] / M[c][c];
+      for (let k = c; k < n + 2; k++) M[r][k] -= f * M[c][k];
+    }
+  }
+  return M.map((r, i) => [_num(r[n] / r[i]), _num(r[n + 1] / r[i])]);
+}
+
 // ── Dimensions ────────────────────────────────────────────────────────────────
 /**
  * Dimension style. Sizes are paper sizes; `scale` (DIMSCALE) multiplies them,
@@ -717,8 +1088,8 @@ class Hatch extends Entity {
  */
 class DimStyle {
   constructor({ name = 'Standard', textHeight = 2.5, arrowSize = 2.5, tickSize = 0, extOffset = 0.625,
-                extBeyond = 1.25, gap = 0.625, decimals = 0, scale = 1, measureScale = 1, suffix = '' } = {}) {
-    Object.assign(this, { name, textHeight, arrowSize, tickSize, extOffset, extBeyond, gap, decimals, scale, measureScale, suffix });
+                extBeyond = 1.25, gap = 0.625, decimals = 0, angleDecimals = 0, scale = 1, measureScale = 1, suffix = '' } = {}) {
+    Object.assign(this, { name, textHeight, arrowSize, tickSize, extOffset, extBeyond, gap, decimals, angleDecimals, scale, measureScale, suffix });
   }
   format(value) {
     return Number(value * this.measureScale).toFixed(this.decimals) + this.suffix;
@@ -729,7 +1100,7 @@ class DimStyle {
     if (this.suffix) lines.push('3', `<>${this.suffix}`);
     lines.push('40', this.scale, '41', this.arrowSize, '42', this.extOffset, '44', this.extBeyond,
                '73', '0', '74', '0', '77', '1', '140', this.textHeight, '142', this.tickSize,
-               '144', this.measureScale, '147', this.gap, '172', '1', '271', this.decimals);
+               '144', this.measureScale, '147', this.gap, '172', '1', '179', this.angleDecimals, '271', this.decimals);
     return lines.join(NL);
   }
 }
@@ -738,7 +1109,53 @@ const _sub = (a, b) => [a[0] - b[0], a[1] - b[1]];
 const _add = (a, b) => [a[0] + b[0], a[1] + b[1]];
 const _mul = (a, k) => [a[0] * k, a[1] * k];
 const _dot = (a, b) => a[0] * b[0] + a[1] * b[1];
+const _unit = v => { const l = Math.hypot(v[0], v[1]); return l > 1e-12 ? [v[0] / l, v[1] / l] : [1, 0]; };
 const _xyz = p => [p[0], p[1], p[2] || 0];
+const _BYBLOCK = { layer: '0', color: 0 };   // dimension geometry follows the DIMENSION's layer/colour
+
+/** Arrowhead (or oblique tick) with its tip at `tip`; `dir` points from the tip into the dimension. */
+function _arrow(tip, dir, style) {
+  const s = style.scale;
+  if (style.tickSize > 0) {
+    const w = _mul(_rot(dir, 45), style.tickSize * s / 2);
+    return new Line([_xyz(_sub(tip, w)), _xyz(_add(tip, w))], _BYBLOCK);
+  }
+  const a = style.arrowSize * s, n = _rot(dir, 90), back = _add(tip, _mul(dir, a));
+  const b1 = _add(back, _mul(n, a / 6)), b2 = _sub(back, _mul(n, a / 6));
+  return new Solid([_xyz(tip), _xyz(b1), _xyz(b2), _xyz(b2)], _BYBLOCK);
+}
+/** Text above a line at angle `ang` through `pt`, rotated to read left→right / bottom→top. */
+function _dimText(txt, pt, ang, style) {
+  let ta = _normAngle(ang);
+  if (ta > 90 && ta <= 270) ta -= 180;
+  const pos = _add(pt, _mul(_rot([0, 1], ta), (style.gap + style.textHeight / 2) * style.scale));
+  return { ent: new Text(txt, _xyz(pos), { height: style.textHeight * style.scale, rotation: ta, align: 'MIDDLE_CENTER', ..._BYBLOCK }), pos };
+}
+
+/** Base class: subclasses implement _render(style) → { ents, defpoint, textPt, measurement, type, sub }. */
+class Dimension extends Entity {
+  constructor({ text = null, dimstyle = 'Standard', ...common } = {}) {
+    super(common); this.text = text; this.dimstyle = dimstyle; this._block = null;
+  }
+  _bbox() { return this._block ? this._block._bbox() : _bboxOf(this._pts()); }
+  _label(value) { return this.text === null ? value : String(this.text).replace('<>', value); }
+  /** Build the anonymous *D block that holds what AutoCAD displays. */
+  _buildBlock(name, style) {
+    this._r = this._render(style);
+    this._block = new Block(name, { flag: 1, entities: this._r.ents });   // flag 1 = anonymous
+    this._styleName = style.name;
+    return this._block;
+  }
+  toString() {
+    if (!this._block) throw new Error('Dimensions must be written through a Drawing (it builds their *D blocks)');
+    const r = this._r;
+    const lines = ['0','DIMENSION',this._common(),'100','AcDbDimension','2',this._block.name,
+                   _point(_xyz(r.defpoint)),_point(_xyz(r.textPt), 1),'70',r.type | 32,'71','5','42',r.measurement];
+    if (this.text !== null) lines.push('1', this.text);
+    lines.push('3', this._styleName, ...r.sub);
+    return [...lines, ...this._xdata()].join(NL);
+  }
+}
 
 /**
  * Linear (rotated) dimension between p1 and p2 measured along `angle`
@@ -747,71 +1164,35 @@ const _xyz = p => [p[0], p[1], p[2] || 0];
  *   new LinearDimension([0,0], [2350,0], [0,-400], { dimstyle: 'S50' })
  * `text`: override, '<>' is replaced by the measurement.
  */
-class LinearDimension extends Entity {
-  constructor(p1, p2, base, { angle = 0, text = null, dimstyle = 'Standard', ...common } = {}) {
-    super(common); this.p1 = p1; this.p2 = p2; this.base = base; this.angle = angle;
-    this.text = text; this.dimstyle = dimstyle; this._block = null;
+class LinearDimension extends Dimension {
+  constructor(p1, p2, base, { angle = 0, ...options } = {}) {
+    super(options); this.p1 = p1; this.p2 = p2; this.base = base; this.angle = angle;
   }
   get aligned() { return false; }
   _pts() { return [this.p1, this.p2, this.base]; }
-  _bbox() { return this._block ? this._block._bbox() : _bboxOf(this._pts()); }
+  _transformExtra(info) { this.angle = _normAngle(info.angle(this.angle)); }
   _dir() { return this.angle; }
   _basePoint() { return this.base; }
-  _geometry(style) {
-    const ang = this._dir(), u = _rot([1, 0], ang), base = this._basePoint();
-    const s = style.scale;
+  _render(style) {
+    const ang = this._dir(), u = _rot([1, 0], ang), base = this._basePoint(), s = style.scale;
     const d1 = _add(base, _mul(u, _dot(_sub(this.p1, base), u)));
     const d2 = _add(base, _mul(u, _dot(_sub(this.p2, base), u)));
     const measurement = Math.abs(_dot(_sub(this.p2, this.p1), u));
-    let txt = style.format(measurement);
-    if (this.text !== null) txt = String(this.text).replace('<>', txt);
-    // readable text direction and the side it sits on
-    let ta = ((ang % 360) + 360) % 360;
-    if (ta > 90 && ta <= 270) ta -= 180;
-    const up = _rot([0, 1], ta);
-    const mid = _mul(_add(d1, d2), 0.5);
-    const textPt = _add(mid, _mul(up, (style.gap + style.textHeight / 2) * s));
-    return { d1, d2, u, measurement, txt, ta, textPt };
-  }
-  /** Build the anonymous *D block that holds what AutoCAD displays. */
-  _buildBlock(name, style) {
-    const g = this._geometry(style), s = style.scale, ents = [];
-    const own = { layer: '0', color: 0 };   // ByBlock: follows the DIMENSION's layer/colour
-    for (const [p, d] of [[this.p1, g.d1], [this.p2, g.d2]]) {
-      const v = _sub(d, p), len = Math.hypot(...v);
-      if (len < 1e-9) continue;
-      const n = _mul(v, 1 / len);
-      ents.push(new Line([_xyz(_add(p, _mul(n, style.extOffset * s))), _xyz(_add(d, _mul(n, style.extBeyond * s)))], own));
+    const ents = [];
+    for (const [p, d] of [[this.p1, d1], [this.p2, d2]]) {   // extension lines
+      const v = _sub(d, p);
+      if (Math.hypot(...v) < 1e-9) continue;
+      const n = _unit(v);
+      ents.push(new Line([_xyz(_add(p, _mul(n, style.extOffset * s))), _xyz(_add(d, _mul(n, style.extBeyond * s)))], _BYBLOCK));
     }
-    ents.push(new Line([_xyz(g.d1), _xyz(g.d2)], own));
-    const v = Math.hypot(..._sub(g.d2, g.d1)) > 1e-9 ? _mul(_sub(g.d2, g.d1), 1 / Math.hypot(..._sub(g.d2, g.d1))) : g.u;
-    for (const [tip, dir] of [[g.d1, v], [g.d2, _mul(v, -1)]]) {
-      if (style.tickSize > 0) {
-        const w = _mul(_rot(dir, 45), style.tickSize * s / 2);
-        ents.push(new Line([_xyz(_sub(tip, w)), _xyz(_add(tip, w))], own));
-      } else {
-        const a = style.arrowSize * s, n = _rot(dir, 90);
-        const back = _add(tip, _mul(dir, a));
-        const b1 = _add(back, _mul(n, a / 6)), b2 = _sub(back, _mul(n, a / 6));
-        ents.push(new Solid([_xyz(tip), _xyz(b1), _xyz(b2), _xyz(b2)], own));
-      }
-    }
-    ents.push(new Text(g.txt, _xyz(g.textPt), { height: style.textHeight * s, rotation: g.ta, align: 'MIDDLE_CENTER', ...own }));
-    this._g = g;
-    this._block = new Block(name, { flag: 1, entities: ents });   // flag 1 = anonymous
-    this._styleName = style.name;
-    return this._block;
-  }
-  toString() {
-    if (!this._block) throw new Error('Dimensions must be written through a Drawing (it builds their *D blocks)');
-    const g = this._g;
-    const lines = ['0','DIMENSION',this._common(),'100','AcDbDimension','2',this._block.name,
-                   _point(_xyz(g.d2)),_point(_xyz(g.textPt), 1),'70',(this.aligned ? 1 : 0) | 32,'71','5',
-                   '42',g.measurement];
-    if (this.text !== null) lines.push('1', this.text);
-    lines.push('3', this._styleName, '100', 'AcDbAlignedDimension', _point(_xyz(this.p1), 3), _point(_xyz(this.p2), 4));
-    if (!this.aligned) lines.push('50', this.angle, '100', 'AcDbRotatedDimension');
-    return [...lines, ...this._xdata()].join(NL);
+    ents.push(new Line([_xyz(d1), _xyz(d2)], _BYBLOCK));
+    const v = Math.hypot(..._sub(d2, d1)) > 1e-9 ? _unit(_sub(d2, d1)) : u;
+    ents.push(_arrow(d1, v, style), _arrow(d2, _mul(v, -1), style));
+    const t = _dimText(this._label(style.format(measurement)), _mul(_add(d1, d2), 0.5), ang, style);
+    ents.push(t.ent);
+    const sub = ['100', 'AcDbAlignedDimension', _point(_xyz(this.p1), 3), _point(_xyz(this.p2), 4)];
+    if (!this.aligned) sub.push('50', this.angle, '100', 'AcDbRotatedDimension');
+    return { ents, defpoint: d2, textPt: t.pos, measurement, type: this.aligned ? 1 : 0, sub };
   }
 }
 /**
@@ -824,8 +1205,110 @@ class AlignedDimension extends LinearDimension {
   }
   get aligned() { return true; }
   _pts() { return [this.p1, this.p2]; }
+  _transformExtra(info) { this.distance *= info.mirror ? -info.s : info.s; }
   _dir() { return Math.atan2(this.p2[1] - this.p1[1], this.p2[0] - this.p1[0]) * 180 / Math.PI; }
   _basePoint() { return _add(this.p1, _mul(_rot([0, 1], this._dir()), this.distance)); }
+}
+/** Radius of an arc/circle at `center`, drawn at `angle` degrees: R250. */
+class RadiusDimension extends Dimension {
+  constructor(center, radius, { angle = 45, ...options } = {}) {
+    super(options); this.center = center; this.point = _add(center, _rot([radius, 0], angle));
+  }
+  _pts() { return [this.center, this.point]; }
+  _render(style) {
+    const r = Math.hypot(..._sub(this.point, this.center)), u = _unit(_sub(this.point, this.center));
+    const ents = [new Line([_xyz(this.center), _xyz(this.point)], _BYBLOCK), _arrow(this.point, _mul(u, -1), style)];
+    const t = _dimText(this._label('R' + style.format(r)), _mul(_add(this.center, this.point), 0.5), Math.atan2(u[1], u[0]) * 180 / Math.PI, style);
+    ents.push(t.ent);
+    return { ents, defpoint: this.center, textPt: t.pos, measurement: r, type: 4,
+             sub: ['100', 'AcDbRadialDimension', _point(_xyz(this.point), 5), '40', '0'] };
+  }
+}
+/** Diameter of a circle at `center`, across the circle at `angle` degrees: Ø500 (%%c). */
+class DiameterDimension extends Dimension {
+  constructor(center, radius, { angle = 45, ...options } = {}) {
+    super(options); this.center = center; this.point = _add(center, _rot([radius, 0], angle));
+  }
+  _pts() { return [this.center, this.point]; }
+  _render(style) {
+    const far = _sub(_mul(this.center, 2), this.point), u = _unit(_sub(this.point, this.center));
+    const dia = 2 * Math.hypot(..._sub(this.point, this.center));
+    const ents = [new Line([_xyz(far), _xyz(this.point)], _BYBLOCK), _arrow(this.point, _mul(u, -1), style), _arrow(far, u, style)];
+    const t = _dimText(this._label('%%c' + style.format(dia)), this.center, Math.atan2(u[1], u[0]) * 180 / Math.PI, style);
+    ents.push(t.ent);
+    return { ents, defpoint: far, textPt: t.pos, measurement: dia, type: 3,
+             sub: ['100', 'AcDbDiametricDimension', _point(_xyz(this.point), 5), '40', '0'] };
+  }
+}
+/**
+ * Angle at `vertex` measured anticlockwise from the line vertex→p1 to vertex→p2,
+ * drawn as an arc of `radius` (default: 60 % of the shorter line).
+ */
+class AngularDimension extends Dimension {
+  constructor(vertex, p1, p2, { radius = null, ...options } = {}) {
+    super(options); this.vertex = vertex; this.p1 = p1; this.p2 = p2;
+    this.radius = radius ?? 0.6 * Math.min(Math.hypot(..._sub(p1, vertex)), Math.hypot(..._sub(p2, vertex)));
+  }
+  _pts() { return [this.vertex, this.p1, this.p2]; }
+  _transformExtra(info) {
+    this.radius *= info.s;
+    if (info.mirror) [this.p1, this.p2] = [this.p2, this.p1];   // keep it anticlockwise
+  }
+  _render(style) {
+    const v = this.vertex, R = this.radius, s = style.scale;
+    const a1 = Math.atan2(this.p1[1] - v[1], this.p1[0] - v[0]) * 180 / Math.PI;
+    const a2 = Math.atan2(this.p2[1] - v[1], this.p2[0] - v[0]) * 180 / Math.PI;
+    const sweep = _normAngle(a2 - a1);
+    const ents = [new Arc(_xyz(v), R, _normAngle(a1), _normAngle(a2), _BYBLOCK)];
+    for (const [p, a] of [[this.p1, a1], [this.p2, a2]]) {   // extension lines when the arc is beyond the lines
+      const d = Math.hypot(..._sub(p, v)), u = _rot([1, 0], a);
+      if (d < R) ents.push(new Line([_xyz(_add(v, _mul(u, d + style.extOffset * s))), _xyz(_add(v, _mul(u, R + style.extBeyond * s)))], _BYBLOCK));
+    }
+    const e1 = _add(v, _rot([R, 0], a1)), e2 = _add(v, _rot([R, 0], a2));
+    ents.push(_arrow(e1, _rot([1, 0], a1 + 90), style), _arrow(e2, _rot([1, 0], a2 - 90), style));
+    const am = a1 + sweep / 2, mid = _add(v, _rot([R, 0], am));
+    const t = _dimText(this._label(sweep.toFixed(style.angleDecimals) + '%%d'), mid, am - 90, style);
+    ents.push(t.ent);
+    return { ents, defpoint: mid, textPt: t.pos, measurement: sweep * Math.PI / 180, type: 5,
+             sub: ['100', 'AcDb3PointAngularDimension', _point(_xyz(this.p1), 3), _point(_xyz(this.p2), 4), _point(_xyz(v), 5)] };
+  }
+}
+
+// ── Leader ────────────────────────────────────────────────────────────────────
+/**
+ * Leader line with an arrow at the first point and optional MText at the last.
+ *   new Leader([[100,100],[250,250],[400,250]], 'T16 @ 200 B1', { dimstyle: 'S50' })
+ * Arrow size and text height come from the dimstyle (× its scale) unless `height` is given.
+ */
+class Leader extends Entity {
+  constructor(points, text = null, { dimstyle = 'Standard', height = null, ...common } = {}) {
+    super(common);
+    if (!points || points.length < 2) throw new Error('Leader needs at least 2 points');
+    this.points = points; this.text = text; this.dimstyle = dimstyle; this.height = height; this._style = null;
+  }
+  _pts() { return this.points; }
+  _transformExtra(info) { if (this.height !== null) this.height *= info.s; }
+  _mtext() {
+    if (this.text === null || this.text === '') return null;
+    const style = this._style || (this.dimstyle instanceof DimStyle ? this.dimstyle : new DimStyle());
+    const n = this.points.length, last = this.points[n - 1], prev = this.points[n - 2];
+    const right = last[0] >= prev[0];
+    const off = style.gap * style.scale * (right ? 1 : -1);
+    return new MText(this.text, [last[0] + off, last[1], 0], {
+      height: this.height ?? style.textHeight * style.scale, attach: right ? 'MIDDLE_LEFT' : 'MIDDLE_RIGHT',
+      layer: this.layer, color: this.color, parent: this.parent });
+  }
+  _bbox() { return _union([_bboxOf(this.points), this._mtext()?._bbox()]); }
+  toString() {
+    const style = this._style || (this.dimstyle instanceof DimStyle ? this.dimstyle : new DimStyle());
+    const mt = this._mtext();
+    const lines = ['0','LEADER',this._common(),'100','AcDbLeader','3',style.name,'71','1','72','0','73','3',
+                   '74','0','75','0','40',mt ? mt.height : 0,'41','0','76',this.points.length];
+    this.points.forEach(p => lines.push(_point(_xyz(p))));
+    lines.push(...this._extr(), ...this._xdata());
+    if (mt) lines.push(mt.toString());
+    return lines.join(NL);
+  }
 }
 
 // ── Main Drawing class ────────────────────────────────────────────────────────
@@ -912,7 +1395,8 @@ class Drawing extends Collection {
     };
     const visit = e => {
       if (e instanceof Insert) { add(e.source); add(e.block); }
-      if (e instanceof LinearDimension && !seen.has(e)) {
+      if (e instanceof Leader) e._style = this._dimstyle(e.dimstyle);
+      if (e instanceof Dimension && !seen.has(e)) {
         seen.add(e);
         out.push(e._buildBlock(`*D${++dimCount}`, this._dimstyle(e.dimstyle)));
       }
@@ -1031,8 +1515,10 @@ class Drawing extends Collection {
 
 if (typeof module !== 'undefined' && module.exports) {
   module.exports = {
-    Drawing, Layer, LineType, Style, DimStyle, Block, DynamicBlock, LinearParameter, Insert, AttDef, Attrib,
-    Line, LwPolyLine, Circle, Arc, Point, Text, MText, Solid, Hatch, LinearDimension, AlignedDimension,
-    Collection, Entity, calculate_end_point, HATCH_PATTERNS, LINETYPE_PRESETS,
+    Drawing, Layer, LineType, Style, DimStyle, Block, DynamicBlock, Insert, AttDef, Attrib,
+    LinearParameter, FlipParameter, VisibilityParameter,
+    Line, LwPolyLine, Circle, Arc, Ellipse, Spline, Point, Text, MText, Solid, Hatch, Leader,
+    Dimension, LinearDimension, AlignedDimension, RadiusDimension, DiameterDimension, AngularDimension,
+    Collection, Entity, arrayRect, arrayPolar, calculate_end_point, HATCH_PATTERNS, LINETYPE_PRESETS,
   };
 }
