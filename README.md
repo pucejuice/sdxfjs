@@ -109,6 +109,33 @@ sheet.addViewport({ center: [400, 320], size: [700, 480],       // on the sheet,
 - Viewports are display-locked by default (`locked: false` to unlock). `vp.modelWindow` gives the model area shown.
 - Anything works on a sheet: title-block inserts with attributes, text, tables, dimensions, images.
 
+### Fields
+Text can contain `{{field}}` or `{{field:format}}`. Fields are resolved for each sheet **when the DXF is written**:
+
+| Field | Value |
+|---|---|
+| `{{layout}}` | Sheet name (`Model` in model space) |
+| `{{sheet}}`, `{{sheets}}` | Sheet number (in `addLayout` order) and number of sheets |
+| `{{scale}}` | Scale of the sheet's first viewport, e.g. `1:50` |
+| `{{date}}`, `{{date:DD MMM YYYY}}` | Date written (tokens `YYYY YY MMM MM DD HH mm`); Drawing option `date` fixes it |
+| `{{filename}}`, `{{units}}` | Drawing options `filename` and `units` |
+| `{{title}}`, `{{author}}`, `{{ProjectNo}}`, … | Anything in Drawing option `properties` (names are case-insensitive) |
+
+```js
+const d = new Drawing({ units: 'mm', filename: 'S-100.dxf',
+  properties: { title: 'Level 2 beams', author: 'DE', ProjectNo: 'P-2041' } });
+const tb = new Block('tb', { entities: [
+  new AttDef('dwg', [295, 30, 0], { height: 4, defaultValue: '{{ProjectNo}}-{{layout}}' }),
+  new AttDef('sheet', [295, 22, 0], { height: 3, defaultValue: 'Sheet {{sheet}} of {{sheets}}  {{scale}}' }),
+] });
+for (const name of ['GA', 'DETAILS']) d.addLayout(name).append(new Insert(tb, [0, 0]));
+```
+- Fields work in TEXT, MTEXT, attributes, table cells, multileaders and dimension text overrides.
+- **Use attributes for values that change per sheet.** Plain text inside a block definition is written once for every sheet, so sheet fields there show `####`, as an invalid AutoCAD field does.
+- An unknown field name throws an error listing the valid ones.
+- `properties` are also stored as the drawing's properties (DWGPROPS: title, subject, author, keywords, comments, revision, plus up to 10 custom ones).
+- **These are not live AutoCAD fields.** AutoCAD FIELD objects and custom drawing properties need DXF 2004+. The values are correct whenever the script regenerates the drawing, but they won't update if a layout is renamed in AutoCAD.
+
 ### Groups
 ```js
 const g = d.addGroup('GRID A', [line1, line2], { description: 'grid line A', selectable: true });
@@ -190,6 +217,7 @@ sdxf.js only **writes** R2000 drawings, and is aimed at 2D drafting automation.
 - LEADER and MULTILEADER (MText or block content).
 - Linked raster images.
 - Paper-space sheets with scaled viewports and per-viewport frozen layers.
+- Text fields resolved per sheet when the file is written (ezdxf has no field support).
 - Tables, drawn from lines and text like ezdxf's table add-on.
 - Transforms and arrays.
 

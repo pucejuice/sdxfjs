@@ -32,7 +32,8 @@
  * arrayPolar; MINSERT grids. Dynamic blocks: flip, visibility, array, lookups.
  * Groups, XLine/Ray, Wipeout, OrdinateDimension, MLeader (MULTILEADER, text or
  * block content), Table, Image/ImageDef (linked raster images),
- * paper-space sheets: Drawing.addLayout + Layout.addViewport.
+ * paper-space sheets: Drawing.addLayout + Layout.addViewport; {{field}} text
+ * fields resolved per sheet at write time (layout, sheet, scale, date, properties).
  * Full API: README.md. Tests: npm test.
  *
  * Blocks & attributes:
@@ -82,6 +83,21 @@ let _owner = null;
 // Groups of the top-level entity being written: its model-space pieces get
 // ACAD_REACTORS to these groups and are recorded as members.
 let _groupCtx = null;
+// Field context while writing: resolves {{name}} / {{name:format}} in text.
+let _fieldCtx = null;
+const _FIELD_RE = /\{\{\s*([A-Za-z_][\w.\- ]*?)\s*(?::([^}]*))?\}\}/g;
+function _fields(s) {
+  if (!_fieldCtx || typeof s !== 'string' || !s.includes('{{')) return s;
+  return s.replace(_FIELD_RE, (_, name, fmt) => _fieldCtx(name, fmt));
+}
+const _MONTHS = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
+/** Date format tokens: YYYY YY MMM MM DD HH mm (anything else is literal). */
+function _formatDate(d, fmt = 'YYYY-MM-DD') {
+  const p = n => String(n).padStart(2, '0');
+  const tokens = { YYYY: d.getFullYear(), YY: p(d.getFullYear() % 100), MMM: _MONTHS[d.getMonth()], MM: p(d.getMonth() + 1),
+                   DD: p(d.getDate()), HH: p(d.getHours()), mm: p(d.getMinutes()) };
+  return fmt.replace(/YYYY|YY|MMM|MM|DD|HH|mm/g, t => tokens[t]);
+}
 // True while writing a paper-space layout: entities get group 67 = 1.
 let _paper = false;
 // Handles that MULTILEADER needs (set by Drawing.toString before the entities).
@@ -246,7 +262,7 @@ function _textBox(p, w, h, col = 0, row = 0) {
 // Shared AcDbText body for TEXT / ATTDEF / ATTRIB. Returns [lines, valign].
 function _textLines(e, value) {
   const [h, v] = _alignCodes(e.align);
-  const lines = ['100','AcDbText',_point(e.point),'40',e.height,'1',value];
+  const lines = ['100','AcDbText',_point(e.point),'40',e.height,'1',_fields(value)];
   if (e.rotation !== null) lines.push('50', e.rotation);
   if (e.style !== null) lines.push('7', e.style);
   if (h) lines.push('72', h);
@@ -899,7 +915,7 @@ class MText extends Entity {
     return _textBox(this.point, w, rows.length * this.height * 1.7 * (this.lineSpacing || 1), a % 3, 2 - Math.floor(a / 3));
   }
   toString() {
-    const t = String(this.text ?? '').replace(/\r?\n/g, '\\P');
+    const t = _fields(String(this.text ?? '')).replace(/\r?\n/g, '\\P');
     if (!t.trim()) return '';
     const attach = _ATTACH[String(this.attach).toUpperCase()];
     if (!attach) throw new Error(`Unknown MText attach '${this.attach}'. Use one of: ${Object.keys(_ATTACH).join(', ')}`);
@@ -1155,7 +1171,7 @@ class Dimension extends Entity {
     super(common); this.text = text; this.dimstyle = dimstyle; this._block = null;
   }
   _bbox() { return this._block ? this._block._bbox() : _bboxOf(this._pts()); }
-  _label(value) { return this.text === null ? value : String(this.text).replace('<>', value); }
+  _label(value) { return this.text === null ? value : _fields(String(this.text)).replace('<>', value); }
   /** Build the anonymous *D block that holds what AutoCAD displays. */
   _buildBlock(name, style) {
     this._r = this._render(style);
@@ -1462,7 +1478,7 @@ class MLeader extends Entity {
         '15',_num(L.position[0]),'25',_num(L.position[1]),'35','0','16',s,'26',s,'36',s,'46','0','93',BYBLOCK,
         ...[1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1].flatMap(v => ['47', v]));   // matrix: unused by AutoCAD/BricsCAD
     } else {
-      lines.push('290','1','304',this.text.replace(/\r?\n/g, '\\P'),
+      lines.push('290','1','304',_fields(this.text).replace(/\r?\n/g, '\\P'),
         '11','0','21','0','31','1','340',_H_TEXTSTYLE,'12',_num(L.tx),'22',_num(L.top),'32','0',
         '13','1','23','0','33','0','42','0','43','0','44','0','45','1','170','1','90',BYBLOCK,'171','1','172','1',
         '91','-939524096','141','1.5','92','0','291','0','292','0','173','0','293','0','142','0','143','0',
@@ -1806,12 +1822,14 @@ class Drawing extends Collection {
   constructor({ insbase = [0,0,0], extmin = null, extmax = null,
                 layers = [new Layer()], linetypes = [new LineType()], styles = [new Style()],
                 dimstyles = [new DimStyle()], views = [], blocks = [], entities = [],
-                units = null, ltscale = 1, wipeoutFrame = false } = {}) {
+                units = null, ltscale = 1, wipeoutFrame = false, properties = {}, filename = '', date = null } = {}) {
     super(entities);
     this.insbase = insbase; this.extmin = extmin; this.extmax = extmax;
     this.layers = [...layers]; this.linetypes = [...linetypes]; this.styles = [...styles];
     this.dimstyles = [...dimstyles]; this.views = [...views]; this.blocks = [...blocks];
     this.units = units; this.ltscale = ltscale; this.wipeoutFrame = wipeoutFrame; this.groups = []; this.layouts = [];
+    // Document properties: title, subject, author, keywords, comments, revision + any custom name → value
+    this.properties = { ...properties }; this.filename = filename; this.date = date;
     if (!this.dimstyles.some(s => s.name.toUpperCase() === 'STANDARD')) this.dimstyles.unshift(new DimStyle());
   }
   /** Create a named group of entities that are (or will be) in this drawing's model space. */
@@ -1828,6 +1846,32 @@ class Drawing extends Collection {
     const l = new Layout(name, options);
     this.layouts.push(l);
     return l;
+  }
+  /**
+   * Field resolver for a context: layout = a Layout, 'Model', or null (inside
+   * block definitions, where per-sheet fields show #### like an invalid AutoCAD field).
+   */
+  _fieldResolver(layout) {
+    const date = this.date ? new Date(this.date) : new Date();
+    const props = new Map(Object.entries(this.properties).map(([k, v]) => [k.toLowerCase(), v]));
+    const sheet = layout instanceof Layout ? layout : null;
+    const vp = sheet && sheet.viewports[0];
+    const builtin = {
+      layout: () => sheet ? sheet.name : layout === 'Model' ? 'Model' : '####',
+      sheet: () => sheet ? String(this.layouts.indexOf(sheet) + 1) : '####',
+      sheets: () => String(this.layouts.length),
+      scale: () => vp ? `1:${_fmt(vp.scale)}` : '####',
+      filename: () => this.filename || '####',
+      date: fmt => _formatDate(date, fmt || undefined),
+      units: () => this.units || '',
+    };
+    return (name, fmt) => {
+      const n = name.trim().toLowerCase();
+      if (builtin[n]) return builtin[n](fmt);
+      if (props.has(n)) return String(props.get(n));
+      throw new Error(`Unknown field {{${name}}}. Built-in: ${Object.keys(builtin).join(', ')}; ` +
+                      `properties: ${[...props.keys()].join(', ') || '(none)'}`);
+    };
   }
   // Model-space and paper-space top-level entities
   _top() { return [...this.entities, ...this.layouts.flatMap(l => l.entities)]; }
@@ -1925,6 +1969,8 @@ class Drawing extends Collection {
     _resetHandles();
     _preAllocHandles();
     _owner = null;
+    const blockFields = this._fieldResolver(null);
+    _fieldCtx = blockFields;
     const userBlocks = this._collectBlocks();
     for (const b of userBlocks) b._btrHandle = _nextHandle();
     this._resolveTables(userBlocks);
@@ -2033,9 +2079,9 @@ class Drawing extends Collection {
     ].join(NL);
     // Paper-space entities: the first layout's go in ENTITIES, the others' in their *Paper_SpaceN block
     const writeLayout = l => {
-      const prev = _owner; _owner = l._btr; _paper = true;
+      const prev = _owner; _owner = l._btr; _paper = true; _fieldCtx = this._fieldResolver(l);
       try { return [l._overall, ...l.entities].map(e => e.toString()).filter(s => s && s.trim()); }
-      finally { _owner = prev; _paper = false; }
+      finally { _owner = prev; _paper = false; _fieldCtx = blockFields; }
     };
     const otherSheets = this.layouts.slice(1).map(l => [
       '0','BLOCK','5',_nextHandle(),'330',l._btr,'100','AcDbEntity','67','1','8','0',
@@ -2043,15 +2089,18 @@ class Drawing extends Collection {
       ...writeLayout(l),
       '0','ENDBLK','5',_nextHandle(),'330',l._btr,'100','AcDbEntity','67','1','8','0','100','AcDbBlockEnd',
     ].join(NL));
+    _fieldCtx = blockFields;
     const blocks = this._section('blocks', [modelBlock, paperBlock, ...otherSheets, ...userBlocks.map(x => x.toString())]);
 
     // ── ENTITIES ─────────────────────────────────────────────────
     _owner = _H_MODEL_BTR;
+    const modelFields = this._fieldResolver('Model');
+    _fieldCtx = modelFields;
     const entities = this._section('entities', this.entities.map(e => {
       _groupCtx = groupOf.get(e) || null;
-      try { return e.toString(); } finally { _groupCtx = null; }
+      try { return e.toString(); } finally { _groupCtx = null; _fieldCtx = modelFields; }
     }).concat(hasLayouts ? writeLayout(this.layouts[0]) : []));
-    _owner = null;
+    _owner = null; _fieldCtx = null;
 
     // ── OBJECTS — root dictionary required for AC1015 ────────────
     const owned = (h, owner) => ['5', h, '102', '{ACAD_REACTORS', '330', owner, '102', '}', '330', owner];
@@ -2060,6 +2109,9 @@ class Drawing extends Collection {
     if (hasWipeout) rootEntries.push(['ACAD_WIPEOUT_VARS', H_WOVARS]);
     if (images.length) rootEntries.push(['ACAD_IMAGE_DICT', H_IMGDICT], ['ACAD_IMAGE_VARS', H_RASTERVARS]);
     if (hasLayouts) rootEntries.push(['ACAD_LAYOUT', H_LAYOUTDICT]);
+    const hasProps = Object.keys(this.properties).length > 0;
+    const H_DWGPROPS = hasProps ? _nextHandle() : null;
+    if (hasProps) rootEntries.push(['DWGPROPS', H_DWGPROPS]);
     const objectDefs = [
       ['0','DICTIONARY','5',H_ROOTDICT,'330','0','100','AcDbDictionary','281','1',
        ...rootEntries.flatMap(([k, h]) => ['3', k, '350', h])].join(NL),
@@ -2118,6 +2170,21 @@ class Drawing extends Collection {
             ...plot({ printer: l.printer, media: l.mediaName, margins: l.margins, size: l.size.map(v => v * mm), inch: l.units === 'in' }),
             ...layout(l.name, i + 1, [[0, 0], l.size], l._btr, l._overall._fixedHandle)].join(NL);
         }));
+    }
+    if (hasProps) {
+      // R2000 DWGPROPS: XRECORD "DWGPROPS COOKIE" (title, subject, author, comments,
+      // keywords, last saved by, revision, 10 custom "name=value" slots, dates)
+      const p = new Map(Object.entries(this.properties).map(([k, v]) => [k.toLowerCase(), [k, v]]));
+      const std = ['title', 'subject', 'author', 'comments', 'keywords', 'lastsavedby', 'revision'];
+      const get = k => p.has(k) ? String(p.get(k)[1]) : '';
+      const custom = [...p.entries()].filter(([k]) => !std.includes(k)).map(([, [k, v]]) => `${k}=${v}`);
+      if (custom.length > 10) throw new Error('DWGPROPS holds at most 10 custom properties in an R2000 file');
+      const jd = (this.date ? new Date(this.date) : new Date()).getTime() / 86400000 + 2440587.5;
+      objectDefs.push(['0','XRECORD',...owned(H_DWGPROPS, H_ROOTDICT),'100','AcDbXrecord','280','1',
+        '1','DWGPROPS COOKIE','2',get('title'),'3',get('subject'),'4',get('author'),'6',get('comments'),
+        '7',get('keywords'),'8',get('lastsavedby'),'9',get('revision'),
+        ...Array.from({ length: 10 }, (_, i) => [String(300 + i), custom[i] || '=']).flat(),
+        '40','0','41',jd,'42',jd,'1','','90','0'].join(NL));
     }
     const objects = this._section('objects', objectDefs);
     _H_MLSTYLE = null;

@@ -396,6 +396,37 @@ test('paper_space_sheets', () => {
   return d;
 });
 
+test('fields', () => {
+  const d = new Drawing({ units: 'mm', filename: 'S-100 Beams.dxf', date: '2026-10-03T09:30:00',
+                          properties: { title: 'Level 2 beams', author: 'D. Engineer', ProjectNo: 'P-2041', Client: 'ACME' } });
+  // Title block: attribute defaults are fields, so every sheet fills its own
+  const title = new Block('tb', { entities: [
+    new LwPolyLine([[10, 10], [410, 10], [410, 287], [10, 287]], { flag: 1 }),
+    new AttDef('dwg', [295, 30, 0], { height: 4, defaultValue: '{{ProjectNo}}-{{layout}}' }),
+    new AttDef('sheet', [295, 22, 0], { height: 3, defaultValue: 'Sheet {{sheet}} of {{sheets}}' }),
+    new AttDef('scale', [295, 16, 0], { height: 2.5, defaultValue: 'Scale {{scale}} @ A3' }),
+    new AttDef('date', [360, 16, 0], { height: 2.5, defaultValue: '{{date:DD MMM YYYY}}' }),
+    new Text('{{layout}}', [20, 20, 0], { height: 3 }),          // plain text inside a block: no sheet → ####
+  ] });
+  d.append(new Circle([0, 0, 0], 1000));
+  d.append(new MText('{{title}}\nFile: {{filename}}  ({{units}})', [0, -1500, 0], { height: 100 }));
+  for (const [name, scale] of [['GA', 100], ['DETAILS', 20]]) {
+    const s = d.addLayout(name);
+    s.append(new Insert(title, [0, 0]));
+    s.addViewport({ center: [150, 150], size: [250, 200], scale });
+    s.append(new Table([20, 280], [['Client', '{{Client}}'], ['Drawn', '{{author}}']], { textHeight: 3 }));
+  }
+  const out = d.toString();
+  assert.ok(out.includes('\nLevel 2 beams\\PFile: S-100 Beams.dxf  (mm)\n'), 'model-space MText fields');
+  assert.ok(out.includes('\nP-2041-GA\n') && out.includes('\nP-2041-DETAILS\n'), 'per-sheet attribute fields');
+  assert.ok(out.includes('\nSheet 2 of 2\n') && out.includes('\nScale 1:20 @ A3\n') && out.includes('\n03 Oct 2026\n'));
+  assert.ok(out.includes('\n####\n'), 'layout field inside a block definition shows ####');
+  assert.ok(out.includes('DWGPROPS COOKIE') && out.includes('\nProjectNo=P-2041\n'), 'document properties stored');
+  assert.ok(!out.includes('{{'), 'no unresolved fields');
+  throws(() => new Drawing({ entities: [new Text('{{nope}}', [0, 0, 0])] }).toString(), /Unknown field \{\{nope\}\}/);
+  return d;
+});
+
 // ── Run ───────────────────────────────────────────────────────────────────────
 let failed = 0;
 for (const t of tests) {
