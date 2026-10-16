@@ -14,6 +14,13 @@
  *    no trailing bare group-code-0, degenerate guard (< 2 points returns '')
  * 10. Text: empty string guard
  * 11. brTable: fixed blank line bug (NL+content → count+NL+content)
+ * 12. $HANDSEED written after all handles are allocated (was fixed at FFFF,
+ *     which is invalid once a drawing holds more than 65 534 objects)
+ * 13. LineType writes its dash elements (group 49/74) and pattern length, so
+ *     dashed linetypes such as HIDDEN or CENTER work
+ * 14. Entity lineTypeScale is written (group 48)
+ * 15. Drawing options insunits ($INSUNITS, 4 = mm) and ltscale ($LTSCALE)
+ * 16. Works as a classic <script>, and as a CommonJS module (module.exports)
  */
 
 const NL = String.fromCharCode(10);
@@ -60,6 +67,7 @@ class Entity {
     // Group 5: unique handle. Group 330: owner = *Model_Space block table record.
     const lines = ['5', _nextHandle(), '330', _H_MODEL_BTR, '100', 'AcDbEntity', '8', parent.layer];
     if (parent.lineType !== null) lines.push('6', parent.lineType);
+    if (parent.lineTypeScale !== null) lines.push('48', parent.lineTypeScale);
     if (parent.lineWeight !== null) lines.push('370', parent.lineWeight);
     if (parent.color !== null && parent.color !== 256) lines.push('62', parent.color);
     return lines.join(NL);
@@ -86,13 +94,18 @@ class Layer {
   }
 }
 class LineType {
+  // elements: dash lengths, positive = dash, negative = gap, 0 = dot,
+  // e.g. HIDDEN: [6.35, -3.175]
   constructor({ name = 'continuous', description = 'Solid line', elements = [], flag = 64 } = {}) {
     this.name = name.toUpperCase(); this.description = description; this.elements = [...elements]; this.flag = flag;
   }
   toString() {
-    return ['0','LTYPE','5',_nextHandle(),'330',_H_LTYPE_TBL,
-            '100','AcDbSymbolTableRecord','100','AcDbLinetypeTableRecord',
-            '2',this.name,'70',this.flag,'3',this.description,'72','65','73',this.elements.length,'40','0.0'].join(NL);
+    const total = this.elements.reduce((s, e) => s + Math.abs(e), 0);
+    const lines = ['0','LTYPE','5',_nextHandle(),'330',_H_LTYPE_TBL,
+                   '100','AcDbSymbolTableRecord','100','AcDbLinetypeTableRecord',
+                   '2',this.name,'70',this.flag,'3',this.description,'72','65','73',this.elements.length,'40',total];
+    for (const e of this.elements) lines.push('49', e, '74', '0');
+    return lines.join(NL);
   }
 }
 class Style {
@@ -192,9 +205,10 @@ class Solid extends Entity {
 class Drawing extends Collection {
   constructor({ insbase = [0,0,0], extmin = [0,0], extmax = [0,0],
                 layers = [new Layer()], linetypes = [new LineType()], styles = [new Style()],
-                views = [], blocks = [], entities = [] } = {}) {
+                views = [], blocks = [], entities = [], insunits = null, ltscale = null } = {}) {
     super(entities);
     this.insbase = insbase; this.extmin = extmin; this.extmax = extmax;
+    this.insunits = insunits; this.ltscale = ltscale;
     this.layers = [...layers]; this.linetypes = [...linetypes]; this.styles = [...styles];
     this.views = [...views]; this.blocks = [...blocks];
   }
@@ -212,15 +226,6 @@ class Drawing extends Collection {
   toString() {
     _resetHandles();
     _preAllocHandles();
-
-    // ── HEADER ──────────────────────────────────────────────────
-    const header = this._section('header', [
-      ['9','$ACADVER','1','AC1015'].join(NL),
-      ['9','$HANDSEED','5','FFFF'].join(NL),
-      ['9','$INSBASE',  _point(this.insbase)].join(NL),
-      ['9','$EXTMIN',   _point(this.extmin)].join(NL),
-      ['9','$EXTMAX',   _point(this.extmax)].join(NL),
-    ]);
 
     // ── TABLES ──────────────────────────────────────────────────
     const brDefs = [
@@ -274,6 +279,24 @@ class Drawing extends Collection {
     // ── OBJECTS — required for AC1015 ────────────────────────────
     const objects = this._section('objects', []);
 
+    // ── HEADER — written last so $HANDSEED is above every handle used ──
+    const headerVars = [
+      ['9','$ACADVER','1','AC1015'].join(NL),
+      ['9','$HANDSEED','5',_nextHandle()].join(NL),
+      ['9','$INSBASE',  _point(this.insbase)].join(NL),
+      ['9','$EXTMIN',   _point(this.extmin)].join(NL),
+      ['9','$EXTMAX',   _point(this.extmax)].join(NL),
+    ];
+    if (this.insunits !== null) headerVars.push(['9','$INSUNITS','70',this.insunits].join(NL));
+    if (this.ltscale !== null) headerVars.push(['9','$LTSCALE','40',this.ltscale].join(NL));
+    const header = this._section('header', headerVars);
+
     return [header, tables, blocks, entities, objects, '0', 'EOF', ''].join(NL);
   }
+}
+
+// ── Module export (CommonJS / Node). Browsers loading this as a classic
+//    <script> get the classes as globals, as before. ─────────────────────────
+if (typeof module !== 'undefined' && module.exports) {
+  module.exports = { Drawing, Layer, LineType, Style, Block, Line, LwPolyLine, Circle, Arc, Point, Text, Solid, Collection, Entity, calculate_end_point };
 }
