@@ -36,7 +36,7 @@ const dwg = new Drawing({
 
 const outline = new LwPolyLine([[0, 0], [b, 0], [b, h], [0, h]], { flag: 1, layer: 'CONCRETE' });
 dwg.append(outline);
-dwg.append(new Hatch(outline, { pattern: 'ANSI31', scale: 5, layer: 'CONCRETE', color: 8 }));
+dwg.append(new Hatch(outline, { pattern: 'AR-CONC', scale: 0.5, layer: 'CONCRETE', color: 8 }));
 
 const o = cover + link / 2;   // link centreline
 dwg.append(new LwPolyLine([[o, o], [b - o, o], [b - o, h - o], [o, h - o]], { flag: 1, width: link, layer: 'REBAR' }));

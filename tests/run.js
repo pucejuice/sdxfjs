@@ -203,8 +203,12 @@ test('hatch_mtext', () => {
   const d = new Drawing({ units: 'mm' });
   const slab = new LwPolyLine([[0, 0], [2000, 0], [2000, 200], [0, 200]], { flag: 1 });
   d.append(slab);
-  for (const [i, pattern] of ['ANSI31', 'ANSI32', 'ANSI37', 'NET', 'DOTS', 'EARTH', 'SOLID'].entries())
-    d.append(new Hatch([[i * 300, 400], [i * 300 + 250, 400], [i * 300 + 250, 650], [i * 300, 650]], { pattern, scale: 5 }));
+  for (const [i, pattern] of ['ANSI31', 'ANSI32', 'ANSI37', 'NET', 'DOTS', 'EARTH', 'AR-CONC', 'SOLID'].entries())
+    d.append(new Hatch([[i * 300, 400], [i * 300 + 250, 400], [i * 300 + 250, 650], [i * 300, 650]], { pattern, scale: pattern === 'AR-CONC' ? 0.5 : 5 }));
+  // AR-CONC first line as acadiso.pat / ezdxf ISO_PATTERN: offset (182.184669, -15.939086) once rotated by 50°
+  const conc = new Hatch([[0, 0], [1, 0], [1, 1]], { pattern: 'ar-conc' }).toString().split('\n');
+  const at = conc.findIndex((v, i) => v === '53' && conc[i + 2] === '43');
+  closePt([+conc[at + 7], +conc[at + 9]], [182.184668996, -15.9390855389], 'AR-CONC offset');
   d.append(new Hatch([[[0, 1000], [500, 1000], [500, 1500], [0, 1500]], [[200, 1200], [300, 1200], [300, 1300], [200, 1300]]], { pattern: 'SOLID' }));
   d.append(new Hatch(new LwPolyLine([[1000, 1250], [1200, 1250]], { flag: 1, bulge: 1 }), { pattern: 'SOLID' }));
   d.append(new MText('NOTES:\nLine 2 ' + 'x'.repeat(600), [0, -100, 0], { height: 20, width: 1500 }));

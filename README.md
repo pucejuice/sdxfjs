@@ -66,7 +66,7 @@ Every entity accepts these options:
 | `Point`, `Solid` | |
 | `Text(text, point, { height, rotation, align })` | `align`: `LEFT`, `CENTER`, `MIDDLE_CENTER`, `TOP_RIGHT`, and so on. |
 | `MText(text, point, { height, width, attach, lineSpacing })` | `\n` starts a new line. |
-| `Hatch(boundary \| [outer, ...holes], { pattern, scale, angle })` | Patterns: `SOLID`, `ANSI31`, `ANSI32`, `ANSI37`, `NET`, `DOTS`, `EARTH`, or `{ name, lines }`. A boundary can be an `LwPolyLine`; its arcs are kept. |
+| `Hatch(boundary \| [outer, ...holes], { pattern, scale, angle })` | Patterns: `SOLID`, `ANSI31`, `ANSI32`, `ANSI37`, `NET`, `DOTS`, `EARTH`, `AR-CONC`, or `{ name, lines }`. Pattern sizes are acadiso.pat (mm); AR-CONC suits a scale of about 0.5 for a 300 mm section. A boundary can be an `LwPolyLine`; its arcs are kept. |
 | `Leader(points, text, { dimstyle, height })` | Classic LEADER: arrow at the first point, MText at the last. |
 | `MLeader(points, text \| { block, attributes }, { dimstyle, height, arrowSize, dogleg, gap, blockScale })` | MULTILEADER: arrow tip … connection point, then a landing and the content on the side the leader points to. Sizes come from the dimstyle; a given `height` scales the rest with it. Block content is centred at the end of the landing and scaled by the same factor, which suits grid bubbles and section markers. R2000 MULTILEADERs can't carry attribute values, so each set of values becomes a fixed block (`BUBBLE__REF-A`). |
 | `Image(imageDef, insert, { width, height, rotation })` | Linked raster image; the lower-left corner sits at `insert`. Give width or height and the other follows the aspect ratio. |

@@ -25,7 +25,7 @@
  * Drawing options: units ('mm','m','in',...) → $INSUNITS/$MEASUREMENT, ltscale,
  *   automatic $EXTMIN/$EXTMAX and *ACTIVE viewport zoomed to the drawing.
  * Entity options: thickness, lineTypeScale, extrusion, trueColor ([r,g,b] or 0xRRGGBB).
- * MText, Hatch (SOLID + ANSI31/32/37, NET, DOTS, EARTH or custom),
+ * MText, Hatch (SOLID + ANSI31/32/37, NET, DOTS, EARTH, AR-CONC or custom),
  * LinearDimension / AlignedDimension with DimStyle (incl. dimscale for plot scale).
  * Ellipse, Spline (control or fit points), Leader, Radius/Diameter/AngularDimension.
  * Transforms on every entity: copy, translate, rotate, scale, mirror; arrayRect,
@@ -945,6 +945,20 @@ const HATCH_PATTERNS = {
   EARTH:  [[0, 0, 0, 6.35, 6.35, 6.35, -6.35], [0, 0, 2.38125, 6.35, 6.35, 6.35, -6.35],
            [0, 0, 4.7625, 6.35, 6.35, 6.35, -6.35], [90, 0.79375, 5.55625, 6.35, 6.35, 6.35, -6.35],
            [90, 3.175, 5.55625, 6.35, 6.35, 6.35, -6.35], [90, 5.55625, 5.55625, 6.35, 6.35, 6.35, -6.35]],
+  'AR-CONC': [                                                          // concrete: random stones and dots
+    [50, 0, 0, 104.896, -149.807, 19.05, -209.55],
+    [355, 0, 0, -51.7610108, 187.2581497, 15.24, -167.6405842],
+    [100.4514447, 15.182007, -1.3282535, 145.5569059, -176.270089, 16.1900088, -178.0902446],
+    [46.1842, 0, 50.8, 157.343, -224.71, 28.575, -314.325],
+    [96.6355576, 22.5899, 47.2965, 218.3357721, -264.4048044, 24.2850231, -267.1356082],
+    [351.1841512, 0, 50.8, 196.6791206, 280.8874036, 22.8599671, -251.4597319],
+    [21, 25.4, 38.1, 104.8956587, -149.8065259, 19.05, -209.55],
+    [326, 25.4, 38.1, -51.7604, 187.258, 15.24, -167.64],
+    [71.451445, 38.0345326, 29.5779001, 145.5567546, -176.2700748, 16.1900088, -178.0899376],
+    [37.5, 0, 0, 53.9242, 65.2018, 0, -165.608, 0, -170.18, 0, -168.275],
+    [7.5, 0, 0, 79.3242, 90.6018, 0, -97.028, 0, -161.798, 0, -64.135],
+    [-32.5, -56.642, 0, 117.434, 68.0212, 0, -63.5, 0, -198.12, 0, -262.89],
+    [-42.5, -82.042, 0, 92.0344, 118.821, 0, -82.55, 0, -131.572, 0, -186.69]],
 };
 /**
  * Hatch inside one or more closed boundaries (the first is the outer, the rest are holes).
