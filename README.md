@@ -1,0 +1,238 @@
+# sdxf.js
+
+Single-file JavaScript library that **writes AutoCAD R2000 (AC1015) DXF** files.
+It is built for drafting automation: geometry driven by engineering calculations,
+blocks with attributes, parametric ("dynamic") blocks, hatches and dimensions.
+It works in Node and the browser and has no dependencies.
+
+```js
+const { Drawing, Layer, LwPolyLine, Hatch, LinearDimension, DimStyle } = require('./sdxf.js');
+
+const d = new Drawing({ units: 'mm', dimstyles: [new DimStyle({ name: '1to20', scale: 20 })] });
+const slab = new LwPolyLine([[0, 0], [3000, 0], [3000, 250], [0, 250]], { flag: 1 });
+d.append(slab);
+d.append(new Hatch(slab, { pattern: 'ANSI31', scale: 10 }));
+d.append(new LinearDimension([0, 0], [3000, 0], [0, -300], { dimstyle: '1to20' }));
+require('fs').writeFileSync('slab.dxf', d.toString());
+```
+
+See `examples/` for complete scripts:
+- `examples/beam_section.js`: an RC section drawn from the design inputs.
+- `examples/dynamic_blocks.js`: beams sized from a list of spans.
+
+## Tests
+
+```
+npm test               # JS assertions + DXF validation (needs: pip install ezdxf)
+npm run test:render    # also renders every test drawing to tests/out/*.png
+```
+
+The test runner does three things:
+1. Runs the JS assertions.
+2. Writes one DXF per test to `tests/out/`.
+3. Checks every file with `tests/check_dxf.py`. That script checks for unique handles, that every owner handle exists, that every block has a block record, and that `$HANDSEED` is valid. It then runs ezdxf's `audit()`, which must report no errors and no fixes.
+
+## API overview
+
+### Drawing
+`new Drawing({ units, ltscale, layers, linetypes, styles, dimstyles, blocks, extmin, extmax })`
+
+| Option | What it does |
+|---|---|
+| `units` | `'mm' \| 'cm' \| 'm' \| 'km' \| 'in' \| 'ft'`, or an `$INSUNITS` code such as `4`. Sets `$INSUNITS` and `$MEASUREMENT`. `insunits` is accepted as an alias. |
+| `ltscale` | Global linetype scale (`$LTSCALE`). |
+| `extmin` / `extmax` | Leave as `null` and they are calculated from the entities. The drawing then opens zoomed to fit. |
+
+- Blocks referenced by an `Insert` are added automatically.
+- Layers used by entities are created automatically.
+- Preset linetypes are added automatically when referenced.
+- `d.extents()` returns `[[xmin, ymin], [xmax, ymax]]`.
+
+### Common entity options
+Every entity accepts these options:
+- `layer`, `color` (ACI), `trueColor` (`[r,g,b]` or `0xRRGGBB`)
+- `lineType`, `lineTypeScale`, `lineWeight`
+- `thickness`, `extrusion`
+- `xdata: { APPNAME: [[1000, 'text'], [1040, 1.5]] }`. The APPIDs are registered for you.
+
+### Entities
+| Class | Notes |
+|---|---|
+| `Line(points)` | |
+| `LwPolyLine(points, { flag, bulge, bulges, width })` | `flag: 1` closes it. |
+| `Circle(center, r)`, `Arc(center, r, start, end)` | Angles in degrees. |
+| `Ellipse(center, majorAxis, ratio, { start, end })` | Params in radians. A ratio above 1 is normalised. |
+| `Spline(controlPoints, { degree })`, `Spline.fromFitPoints(points)` | Clamped B-spline; `fromFitPoints` passes through every point. |
+| `Point`, `Solid` | |
+| `Text(text, point, { height, rotation, align })` | `align`: `LEFT`, `CENTER`, `MIDDLE_CENTER`, `TOP_RIGHT`, and so on. |
+| `MText(text, point, { height, width, attach, lineSpacing })` | `\n` starts a new line. |
+| `Hatch(boundary \| [outer, ...holes], { pattern, scale, angle })` | Patterns: `SOLID`, `ANSI31`, `ANSI32`, `ANSI37`, `NET`, `DOTS`, `EARTH`, `AR-CONC`, or `{ name, lines }`. Pattern sizes are acadiso.pat (mm); AR-CONC suits a scale of about 0.5 for a 300 mm section. A boundary can be an `LwPolyLine`; its arcs are kept. |
+| `Leader(points, text, { dimstyle, height })` | Classic LEADER: arrow at the first point, MText at the last. |
+| `MLeader(points, text \| { block, attributes }, { dimstyle, height, arrowSize, dogleg, gap, blockScale })` | MULTILEADER: arrow tip … connection point, then a landing and the content on the side the leader points to. Sizes come from the dimstyle; a given `height` scales the rest with it. Block content is centred at the end of the landing and scaled by the same factor, which suits grid bubbles and section markers. R2000 MULTILEADERs can't carry attribute values, so each set of values becomes a fixed block (`BUBBLE__REF-A`). |
+| `Image(imageDef, insert, { width, height, rotation })` | Linked raster image; the lower-left corner sits at `insert`. Give width or height and the other follows the aspect ratio. |
+| `ImageDef(filename, [wPx, hPx])`, `ImageDef.fromFile(path)`, `ImageDef.fromBytes(name, bytes)` | The image file reference. `fromFile` (Node) and `fromBytes` (browser) read the pixel size from PNG, JPEG, GIF or BMP headers. The file is linked, not embedded, so keep it next to the DXF or use a full path. |
+| `Table(topLeft, rows, { title, colWidths, rowHeights, textHeight, align, header, headerFill, format, rotation })` | Drawn with lines, MText and solid fills. Cells can be values or `{ text, align, colspan, rowspan, fill }`. Sizes left as `null` fit the text. |
+| `XLine(point, direction)`, `Ray(point, direction)` | Construction lines. |
+| `Wipeout(points)` | Masks what was drawn before it, so append it before the text on top. Drawing option `wipeoutFrame`. |
+| `Insert(block, point, { rotation, xscale, yscale, attributes, params, rows, cols, rowSpacing, colSpacing })` | `rows`/`cols` make a grid of block references (MINSERT). |
+
+### Dimensions
+These match ezdxf's argument order where possible:
+
+| Class | Notes |
+|---|---|
+| `LinearDimension(p1, p2, base, { angle })` | `angle`: 0 = horizontal, 90 = vertical. |
+| `AlignedDimension(p1, p2, distance)` | |
+| `RadiusDimension(center, r, { angle })` | Text: `R400`. |
+| `DiameterDimension(center, r, { angle })` | Text: `Ø800`. |
+| `AngularDimension(vertex, p1, p2, { radius })` | Measured anticlockwise from p1 to p2. |
+| `OrdinateDimension(feature, leaderEnd, { origin, axis })` | X or Y distance from `origin`. `axis` defaults to `'x'` when the leader is mostly vertical. |
+
+- `text: 'd = <>'` overrides the text; `<>` is replaced by the measured value.
+- The script draws each dimension's lines and text itself, so it renders the same everywhere.
+
+`DimStyle({ name, scale, textHeight, arrowSize, tickSize, gap, decimals, angleDecimals, measureScale, suffix })`:
+- `scale` is DIMSCALE. Use 50 for a 1:50 drawing in mm.
+- `tickSize > 0` draws oblique ticks instead of arrows.
+
+### Paper-space sheets
+```js
+const sheet = d.addLayout('S-101', { paper: 'A1' });            // A0–A4 landscape, or size: [w, h]
+sheet.append(new Insert(titleBlock, [0, 0], { attributes: { 'dwg no': 'S-101', scale: '1:50' } }));
+sheet.addViewport({ center: [400, 320], size: [700, 480],       // on the sheet, in mm
+                    viewCenter: [3000, 1500], scale: 50,         // model point at the centre, 1:50
+                    freeze: ['DIMS'] });                         // layers hidden in this viewport only
+```
+- Paper coordinates are mm with (0, 0) at the sheet's lower-left corner (`units: 'in'` for inch sheets).
+- The first layout added is the active one. Each sheet gets AutoCAD's whole-sheet viewport automatically.
+- Plot setup: printer `DWG To PDF.pc3`, ISO full-bleed media (`mediaName` to override), 1:1.
+- Viewports are display-locked by default (`locked: false` to unlock). `vp.modelWindow` gives the model area shown.
+- Anything works on a sheet: title-block inserts with attributes, text, tables, dimensions, images.
+
+### Fields
+Text can contain `{{field}}` or `{{field:format}}`. Fields are resolved for each sheet **when the DXF is written**:
+
+| Field | Value |
+|---|---|
+| `{{layout}}` | Sheet name (`Model` in model space) |
+| `{{sheet}}`, `{{sheets}}` | Sheet number (in `addLayout` order) and number of sheets |
+| `{{scale}}` | Scale of the sheet's first viewport, e.g. `1:50` |
+| `{{date}}`, `{{date:DD MMM YYYY}}` | Date written (tokens `YYYY YY MMM MM DD HH mm`); Drawing option `date` fixes it |
+| `{{filename}}`, `{{units}}` | Drawing options `filename` and `units` |
+| `{{title}}`, `{{author}}`, `{{ProjectNo}}`, … | Anything in Drawing option `properties` (names are case-insensitive) |
+
+```js
+const d = new Drawing({ units: 'mm', filename: 'S-100.dxf',
+  properties: { title: 'Level 2 beams', author: 'DE', ProjectNo: 'P-2041' } });
+const tb = new Block('tb', { entities: [
+  new AttDef('dwg', [295, 30, 0], { height: 4, defaultValue: '{{ProjectNo}}-{{layout}}' }),
+  new AttDef('sheet', [295, 22, 0], { height: 3, defaultValue: 'Sheet {{sheet}} of {{sheets}}  {{scale}}' }),
+] });
+for (const name of ['GA', 'DETAILS']) d.addLayout(name).append(new Insert(tb, [0, 0]));
+```
+- Fields work in TEXT, MTEXT, attributes, table cells, multileaders and dimension text overrides.
+- **Use attributes for values that change per sheet.** Plain text inside a block definition is written once for every sheet, so sheet fields there show `####`, as an invalid AutoCAD field does.
+- An unknown field name throws an error listing the valid ones.
+- `properties` are also stored as the drawing's properties (DWGPROPS: title, subject, author, keywords, comments, revision, plus up to 10 custom ones).
+- **These are not live AutoCAD fields.** AutoCAD FIELD objects and custom drawing properties need DXF 2004+. The values are correct whenever the script regenerates the drawing, but they won't update if a layout is renamed in AutoCAD.
+
+### Groups
+```js
+const g = d.addGroup('GRID A', [line1, line2], { description: 'grid line A', selectable: true });
+g.add(line3);
+```
+Group members must be in the drawing's model space. A `Table` or `Leader` joins as all of its pieces.
+
+### Transforms and arrays
+Every entity has these methods, which change it in place and can be chained:
+- `copy()`
+- `translate(dx, dy)`
+- `rotate(deg, center)`
+- `scale(factor, center)`
+- `mirror(p1, p2)`. Mirrored text stays readable, like AutoCAD with MIRRTEXT = 0.
+
+`arrayRect(entities, { rows, cols, rowSpacing, colSpacing })` and
+`arrayPolar(entities, { count, center, angle, rotateItems })` return copies.
+
+### Blocks and attributes
+```js
+const title = new Block('title', { entities: [
+  new AttDef('drawing no', [10, 60, 0], { height: 20, prompt: 'Drawing number' }),
+  new AttDef('rev', [10, 20, 0], { height: 20, defaultValue: 'A' }),
+] });
+d.append(new Insert(title, [5000, 0], { attributes: { 'drawing no': 'S-101' } }));
+```
+- `AttDef` flags: `invisible`, `constant`, `verify`, `preset`.
+- `Insert` creates the attribute values and places them using its position, scale and rotation.
+- An unknown attribute name throws an error listing the valid names.
+
+### Parametric (dynamic) blocks
+```js
+const beam = new DynamicBlock('beam', { entities: [outline, mark] });
+beam.addLinearParameter('length', [0, 0], [1000, 0], { min: 500, max: 6000, increment: 50 });
+beam.addStretchAction('length', { frame: [[900, -10], [1100, 210]] });
+beam.addMoveAction('length', { entities: [mark], multiplier: 0.5 });
+d.append(new Insert(beam, [0, 0], { params: { length: 2337 } }));   // snaps to 2350
+```
+
+Parameters:
+
+| Parameter | Settings |
+|---|---|
+| `addLinearParameter(name, base, end, opts)` | `min`, `max`, `increment`, `values`, `baseLocation: 'start' \| 'midpoint'`. |
+| `addFlipParameter(name, base, end)` | |
+| `addVisibilityStates({ PLAN: [...], ELEVATION: [...] }, { defaultState })` | |
+| `addLookup('section', { UB254: { depth: 254, width: 146 }, ... })` | One key sets several parameters. |
+
+Actions:
+
+| Action | Settings |
+|---|---|
+| `addStretchAction(param, { frame, entities, grip, multiplier, angleOffset })` | |
+| `addMoveAction(param, { entities, ... })` | |
+| `addArrayAction(param, { entities, spacing, inclusive })` | Count = floor(value / spacing), like AutoCAD; `inclusive: true` adds one. |
+| `addFlipAction(param, { entities })` | |
+
+- **Variants:** each set of values becomes one ordinary block, named `NAME__PARAM-VALUE__...`, created once and reused.
+- **Reading back:** the chosen values are stored on the block reference as XDATA under `SDXF_DYNBLOCK`. In ezdxf: `insert.get_xdata('SDXF_DYNBLOCK')`.
+- **Not editable in AutoCAD:** the output does **not** contain AutoCAD's own dynamic-block objects (AcDbEvalGraph etc., which Autodesk doesn't document). The geometry is fixed when the file is written; there are no grips to drag in AutoCAD.
+
+### Text encoding
+R2000 DXF is not UTF-8. Non-ASCII characters (², °, Ø) are written as `\U+XXXX`, which AutoCAD decodes.
+ezdxf's plain `readfile` leaves those codes as literal text. `%%c` (Ø), `%%d` (°) and `%%p` (±) work everywhere.
+
+## Compared with ezdxf
+
+ezdxf is a ~140k-line Python library that **reads, edits and writes** every DXF version.
+sdxf.js only **writes** R2000 drawings, and is aimed at 2D drafting automation.
+
+**Similar to ezdxf**
+- Lines, polylines, arcs, circles, ellipses, splines, XLINE/RAY and wipeouts.
+- TEXT and MTEXT.
+- Hatches: solid, standard patterns, holes and arcs.
+- Blocks, block references with attributes, and grids of block references (MINSERT).
+- Groups and XDATA.
+- Layers, linetypes, lineweights and true colour.
+- Linear, aligned, radius, diameter, angular and ordinate dimensions.
+- LEADER and MULTILEADER (MText or block content).
+- Linked raster images.
+- Paper-space sheets with scaled viewports and per-viewport frozen layers.
+- Text fields resolved per sheet when the file is written (ezdxf has no field support).
+- Tables, drawn from lines and text like ezdxf's table add-on.
+- Transforms and arrays.
+
+**Beyond ezdxf:** parametric blocks with stretch, move, array, flip, visibility states and lookup tables.
+
+**Missing, roughly smallest effort first**
+
+| Feature | Effort |
+|---|---|
+| Non-rectangular (clipped) viewports, plot style tables | S–M |
+| R12 output | M |
+| AutoCAD's own TABLE entity (needs DXF 2004+; ezdxf can't create it either) | L |
+| 3D entities (3DFACE, MESH, polyface), ACIS solids | L |
+| Reading and editing existing DXF files, other DXF versions, binary DXF | Very large (essentially ezdxf's core) |
+| Rendering to SVG/PDF/PNG, font-based text measurement, geometry kernel | Very large |
+
+**Reading and editing:** for that, use ezdxf from Python or a JS parser such as `dxf-parser`.
+Parity on the writing side for 2D drafting is realistic; matching all of ezdxf is not a sensible goal for this project.
