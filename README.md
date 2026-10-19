@@ -39,7 +39,7 @@ The test runner does three things:
 
 | Option | What it does |
 |---|---|
-| `units` | `'mm' \| 'cm' \| 'm' \| 'km' \| 'in' \| 'ft'`. Sets `$INSUNITS` and `$MEASUREMENT`. |
+| `units` | `'mm' \| 'cm' \| 'm' \| 'km' \| 'in' \| 'ft'`, or an `$INSUNITS` code such as `4`. Sets `$INSUNITS` and `$MEASUREMENT`. `insunits` is accepted as an alias. |
 | `ltscale` | Global linetype scale (`$LTSCALE`). |
 | `extmin` / `extmax` | Leave as `null` and they are calculated from the entities. The drawing then opens zoomed to fit. |
 

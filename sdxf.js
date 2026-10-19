@@ -22,7 +22,8 @@
  * 15. Style defaults: width factor 1, oblique 0 (were 40/50 → 40x wide text)
  * 16. Non-ASCII text (², °, Ø) written as \U+XXXX escapes; $DWGCODEPAGE set
  *
- * Drawing options: units ('mm','m','in',...) → $INSUNITS/$MEASUREMENT, ltscale,
+ * Drawing options: units ('mm','m','in',... or an $INSUNITS code; alias insunits)
+ *   → $INSUNITS/$MEASUREMENT, ltscale,
  *   automatic $EXTMIN/$EXTMAX and *ACTIVE viewport zoomed to the drawing.
  * Entity options: thickness, lineTypeScale, extrusion, trueColor ([r,g,b] or 0xRRGGBB).
  * MText, Hatch (SOLID + ANSI31/32/37, NET, DOTS, EARTH, AR-CONC or custom),
@@ -1836,12 +1837,12 @@ class Drawing extends Collection {
   constructor({ insbase = [0,0,0], extmin = null, extmax = null,
                 layers = [new Layer()], linetypes = [new LineType()], styles = [new Style()],
                 dimstyles = [new DimStyle()], views = [], blocks = [], entities = [],
-                units = null, ltscale = 1, wipeoutFrame = false, properties = {}, filename = '', date = null } = {}) {
+                units = null, insunits = null, ltscale = 1, wipeoutFrame = false, properties = {}, filename = '', date = null } = {}) {
     super(entities);
     this.insbase = insbase; this.extmin = extmin; this.extmax = extmax;
     this.layers = [...layers]; this.linetypes = [...linetypes]; this.styles = [...styles];
     this.dimstyles = [...dimstyles]; this.views = [...views]; this.blocks = [...blocks];
-    this.units = units; this.ltscale = ltscale; this.wipeoutFrame = wipeoutFrame; this.groups = []; this.layouts = [];
+    this.units = units ?? insunits; this.ltscale = ltscale; this.wipeoutFrame = wipeoutFrame; this.groups = []; this.layouts = [];
     // Document properties: title, subject, author, keywords, comments, revision + any custom name → value
     this.properties = { ...properties }; this.filename = filename; this.date = date;
     if (!this.dimstyles.some(s => s.name.toUpperCase() === 'STANDARD')) this.dimstyles.unshift(new DimStyle());
@@ -1925,7 +1926,8 @@ class Drawing extends Collection {
   _unitVars() {
     if (this.units === null) return [];
     const codes = { in: 1, ft: 2, mi: 3, mm: 4, cm: 5, m: 6, km: 7 };
-    const u = codes[String(this.units).toLowerCase()];
+    // A $INSUNITS code (e.g. 4) is accepted too, as the earlier `insunits` option took
+    const u = Object.values(codes).includes(this.units) ? this.units : codes[String(this.units).toLowerCase()];
     if (!u) throw new Error(`Unknown units '${this.units}'. Use one of: ${Object.keys(codes).join(', ')}`);
     return [['9','$INSUNITS','70',u].join(NL), ['9','$MEASUREMENT','70',u <= 3 ? 0 : 1].join(NL)];
   }

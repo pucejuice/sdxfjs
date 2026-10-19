@@ -205,6 +205,8 @@ test('hatch_mtext', () => {
   d.append(slab);
   for (const [i, pattern] of ['ANSI31', 'ANSI32', 'ANSI37', 'NET', 'DOTS', 'EARTH', 'AR-CONC', 'SOLID'].entries())
     d.append(new Hatch([[i * 300, 400], [i * 300 + 250, 400], [i * 300 + 250, 650], [i * 300, 650]], { pattern, scale: pattern === 'AR-CONC' ? 0.5 : 5 }));
+  // `insunits` (an $INSUNITS code) is an alias of `units`
+  assert.ok(new Drawing({ insunits: 4 }).toString().includes('$INSUNITS\n70\n4'), 'insunits alias');
   // AR-CONC first line as acadiso.pat / ezdxf ISO_PATTERN: offset (182.184669, -15.939086) once rotated by 50°
   const conc = new Hatch([[0, 0], [1, 0], [1, 1]], { pattern: 'ar-conc' }).toString().split('\n');
   const at = conc.findIndex((v, i) => v === '53' && conc[i + 2] === '43');
